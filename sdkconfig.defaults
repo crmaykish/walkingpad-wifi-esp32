@@ -1,0 +1,19 @@
+# Project defaults applied by `idf.py set-target` (committed; the generated
+# sdkconfig is not). Tuned for the ESP32-D0WD board on this machine.
+
+# This board's crystal is marginal — pin the XTAL to 40 MHz so the UART baud
+# stays put across boots (otherwise some boots derive the clock from 26 MHz
+# and shift the console baud).
+CONFIG_ESP32_XTAL_FREQ_40=y
+
+# Console baud the host reader expects.
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# --- OTA / sealed-unit ---
+# Use the full 4 MB flash and a dual-app-slot table so firmware can be updated
+# over WiFi (/update) without opening the enclosure.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_TWO_OTA=y
+# Auto-roll-back an OTA image that never reaches the "mark valid" point
+# (i.e. a bad flash that can't boot/connect) to the previous working app.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

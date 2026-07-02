@@ -1,0 +1,12 @@
+# Build output
+build/
+.cache/
+compile_commands.json
+
+# ESP-IDF generated config (commit sdkconfig.defaults instead)
+sdkconfig
+sdkconfig.old
+managed_components/
+
+# local secrets (never commit)
+wifi_secrets.h
