@@ -1,25 +1,31 @@
 /*
  * walkingpad-bridge — taps the walking pad's console->drive UART (pin 5, 2400 8N1),
- * decodes speed, integrates distance, and serves it as JSON + a tiny web page over WiFi.
+ * decodes speed, integrates distance, logs speed-change events to flash, and serves
+ * it all as JSON + a web page over WiFi.
  *
  * Frame: AA <cmd> <HH> <LL> <CK> 55     (CK = (cmd + HH + LL) & 0xFF)
  *   cmd 0x42 = run-at-speed, value V = HH*256 + LL, mph = (V - 105) / 160
- *   cmd 0x40 / 0xA2 = idle/stopped -> 0 mph
- * Distance = integral of speed*dt (same as the console). Steps NOT on the wire; est only.
+ *   cmd 0x40 / 0xA2 / 0x50 = idle/stopped -> 0 mph
  *
  * Wiring: pin5 --(4.7k series + 10k to GND, ~3.4V)--> RX2/GPIO16 (UART2 RX); pin1 -> GND;
- *         pad 5V rail -> ESP32 5V/VIN. RX only, no TX wire. (Passive divider — do NOT use
- *         an active/bidirectional level shifter here; it back-drives pin5 and trips E07.)
+ *         pad 5V rail -> ESP32 5V/VIN. RX only. PASSIVE divider — no active level shifter.
  *
- * Sealed-unit features: OTA (/update, dual-slot + rollback), mDNS (walkingpad.local),
- * WiFi setup AP fallback, distance persisted to NVS.
+ * Logging: 8-byte records {epoch, 0.1mph, flags, checksum} appended to a SEGMENTED
+ * CIRCULAR LOG on LittleFS (LOG_SEGS files of LOG_SEG_BYTES each). When the active
+ * segment fills, we advance to the next and ERASE it — so the newest ~(LOG_SEGS-1)
+ * segments are always kept and the oldest drops off. Bounded forever, never fails.
+ * Reconstruct hours/miles from the timestamped records (see /stats and /log.csv).
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -28,6 +34,8 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
+#include "esp_sntp.h"
+#include "esp_littlefs.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_http_server.h"
@@ -47,17 +55,23 @@
 #endif
 #define HOSTNAME    "walkingpad"       /* -> http://walkingpad.local/ */
 #define STRIDE_M    0.67               /* metres/step (rough; tune to taste) */
+#define NTP_SERVER  "pool.ntp.org"
 /* --------------------------------------------------- */
 
-#define PAD_UART       UART_NUM_2
-#define PAD_RX_GPIO    16              /* = the board's RX2 pin */
-#define PAD_BAUD       2400
-#define STALE_US       2000000LL       /* no valid frame for 2s -> speed 0 */
-#define AP_FALLBACK_US 30000000LL      /* no STA connect in 30s -> open setup AP */
-#define ODO_SAVE_US    30000000LL      /* persist distance at most every 30s */
+#define PAD_UART        UART_NUM_2
+#define PAD_RX_GPIO     16             /* = the board's RX2 pin */
+#define PAD_BAUD        2400
+#define STALE_US        2000000LL      /* no valid frame for 2s -> speed 0 */
+#define AP_FALLBACK_US  30000000LL     /* no STA connect in 30s -> open setup AP */
+#define ODO_SAVE_US     30000000LL     /* persist odometer at most every 30s */
+#define LOG_DEBOUNCE_US 400000LL       /* speed must settle 0.4s before logging */
+#define LOG_HB_US       240000000LL    /* heartbeat record every 4 min while moving */
+#define LOG_GAP_CAP_S   600            /* moving segment > 10 min => treat as power gap */
+#define EPOCH_VALID     1600000000UL   /* time() beyond this => NTP-synced */
+#define LOG_SEGS        6              /* circular log: this many segment files ... */
+#define LOG_SEG_BYTES   (100 * 1024)   /* ... of this size each (6*100K = 600K < 960K part) */
 
 static const char *TAG = "pad";
-
 #define MINI(a,b) ((a) < (b) ? (a) : (b))
 
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
@@ -70,15 +84,32 @@ static int64_t  g_last_frame_us = 0;
 static int64_t  g_boot_us = 0;
 static volatile bool g_connected = false;
 static volatile bool g_ap_active = false;
+static volatile bool g_time_synced = false;
 static char     g_ip[16] = "0.0.0.0";
 static esp_timer_handle_t g_fallback_timer;
+
+/* segmented circular log */
+static SemaphoreHandle_t g_log_mux;
+static FILE    *g_logf = NULL;       /* append handle for the active segment */
+static int      g_seg  = 0;          /* active segment index */
+static long     g_seg_bytes = 0;     /* bytes written to the active segment */
+static uint32_t g_log_records = 0;   /* total records currently stored (all segments) */
+static int      g_logged_dmph = -1;  /* last logged speed, 0.1 mph units */
+
+typedef struct __attribute__((packed)) {
+    uint32_t ts;      /* epoch seconds, 0 if not yet NTP-synced */
+    uint16_t dmph;    /* speed in 0.1 mph */
+    uint8_t  flags;   /* bit0: time valid */
+    uint8_t  ck;      /* sum(bytes[0..6]) & 0xFF */
+} logrec_t;
 
 static inline float mph_from_V(uint16_t V) {
     float m = ((float)V - 105.0f) / 160.0f;
     return m < 0.0f ? 0.0f : m;
 }
+static void seg_path(int i, char *out, size_t n) { snprintf(out, n, "/lfs/walk.%d", i); }
 
-/* ------------------- NVS: creds + odometer ------------------- */
+/* ------------------- NVS: creds + odometer + log-segment ------------------- */
 static bool nvs_load_creds(char *ssid, size_t ss, char *pass, size_t ps) {
     nvs_handle_t h; bool ok = false;
     if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) {
@@ -107,8 +138,16 @@ static void nvs_save_odo(double mi) {
         nvs_set_blob(h, "odo", &mi, sizeof(mi)); nvs_commit(h); nvs_close(h);
     }
 }
+static int nvs_load_seg(void) {
+    nvs_handle_t h; uint8_t v = 0;
+    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, "logseg", &v); nvs_close(h); }
+    return v % LOG_SEGS;
+}
+static void nvs_save_seg(int s) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "logseg", (uint8_t)s); nvs_commit(h); nvs_close(h); }
+}
 
-/* mark a freshly-OTA'd image good so the bootloader won't roll it back */
 static void ota_mark_valid(void) {
     static bool done = false;
     if (done) return;
@@ -121,13 +160,66 @@ static void ota_mark_valid(void) {
     }
 }
 
-/* ------------------- UART decode + distance ------------------- */
+/* ------------------- segmented circular log ------------------- */
+static void log_fs_init(void) {
+    esp_vfs_littlefs_conf_t c = {
+        .base_path = "/lfs", .partition_label = "storage",
+        .format_if_mount_failed = true, .dont_mount = false,
+    };
+    esp_err_t e = esp_vfs_littlefs_register(&c);
+    if (e != ESP_OK) { ESP_LOGE(TAG, "littlefs mount failed: %s", esp_err_to_name(e)); return; }
+    size_t total = 0, used = 0; esp_littlefs_info("storage", &total, &used);
+    g_seg = nvs_load_seg();
+    g_log_records = 0;
+    char p[24]; struct stat stt;
+    for (int i = 0; i < LOG_SEGS; i++) { seg_path(i, p, sizeof(p)); if (stat(p, &stt) == 0) g_log_records += (uint32_t)(stt.st_size / sizeof(logrec_t)); }
+    seg_path(g_seg, p, sizeof(p));
+    g_logf = fopen(p, "ab");
+    g_seg_bytes = (stat(p, &stt) == 0) ? (long)stt.st_size : 0;
+    ESP_LOGI(TAG, "littlefs %uKB/%uKB used; log seg %d, %lu records total",
+             (unsigned)(used / 1024), (unsigned)(total / 1024), g_seg, (unsigned long)g_log_records);
+}
+/* advance to the next segment, erasing it (drops the oldest data). Call with mutex held. */
+static void log_advance(void) {
+    int next = (g_seg + 1) % LOG_SEGS;
+    char p[24]; seg_path(next, p, sizeof(p));
+    struct stat stt;
+    if (stat(p, &stt) == 0 && g_log_records >= stt.st_size / sizeof(logrec_t))
+        g_log_records -= (uint32_t)(stt.st_size / sizeof(logrec_t));
+    if (g_logf) { fclose(g_logf); g_logf = NULL; }
+    remove(p);
+    g_logf = fopen(p, "ab");
+    g_seg = next; g_seg_bytes = 0;
+    nvs_save_seg(next);
+    ESP_LOGW(TAG, "log rollover -> segment %d (oldest dropped)", next);
+}
+static void log_append(int dmph) {
+    xSemaphoreTake(g_log_mux, portMAX_DELAY);
+    if (g_logf && g_seg_bytes + (long)sizeof(logrec_t) > LOG_SEG_BYTES) log_advance();
+    if (g_logf) {
+        time_t now = time(NULL);
+        logrec_t r;
+        r.ts = (now > (time_t)EPOCH_VALID) ? (uint32_t)now : 0;
+        r.dmph = (uint16_t)(dmph < 0 ? 0 : dmph);
+        r.flags = r.ts ? 1 : 0;
+        uint8_t *b = (uint8_t *)&r, s = 0;
+        for (int i = 0; i < 7; i++) s += b[i];
+        r.ck = s;
+        if (fwrite(&r, 1, sizeof(r), g_logf) == sizeof(r)) {
+            fflush(g_logf); fsync(fileno(g_logf));
+            g_seg_bytes += sizeof(r); g_log_records++;
+        }
+    }
+    xSemaphoreGive(g_log_mux);
+}
+
+/* ------------------- UART decode + distance + logging ------------------- */
 static void uart_task(void *arg) {
     uint8_t rx[128];
     uint8_t acc[64];
     int alen = 0;
     int64_t last_int = esp_timer_get_time();
-    int64_t last_save = last_int;
+    int64_t last_save = last_int, last_log = last_int, change_us = 0;
     double  last_saved = g_dist_mi;
     for (;;) {
         int n = uart_read_bytes(PAD_UART, rx, sizeof(rx), pdMS_TO_TICKS(50));
@@ -144,8 +236,6 @@ static void uart_task(void *arg) {
                 if (f[5] == 0x55 && (uint8_t)(f[1] + f[2] + f[3]) == f[4]) {
                     uint8_t cmd = f[1];
                     uint16_t V = ((uint16_t)f[2] << 8) | f[3];
-                    /* only cmd 0x42 carries a speed setpoint; all other cmds
-                       (0x40/0xA2/0x50 idle polls, etc.) mean not running -> 0 */
                     float sp = (cmd == 0x42) ? mph_from_V(V) : 0.0f;
                     taskENTER_CRITICAL(&mux);
                     g_cmd = cmd; g_rawV = V; g_speed_mph = sp;
@@ -162,11 +252,26 @@ static void uart_task(void *arg) {
         taskENTER_CRITICAL(&mux);
         if (g_last_frame_us && (now - g_last_frame_us) > STALE_US) g_speed_mph = 0.0f;
         g_dist_mi += (double)g_speed_mph * ((double)dt / 1e6) / 3600.0;
+        float cur = g_speed_mph;
         double snapshot = g_dist_mi;
         taskEXIT_CRITICAL(&mux);
-        /* persist odometer periodically if it moved */
+
         if (now - last_save > ODO_SAVE_US && snapshot - last_saved > 0.005) {
             nvs_save_odo(snapshot); last_saved = snapshot; last_save = now;
+        }
+
+        int cur_dmph = (int)(cur * 10.0f + 0.5f);
+        if (cur_dmph != g_logged_dmph) {
+            if (change_us == 0) change_us = now;                 /* start debounce */
+            if (now - change_us > LOG_DEBOUNCE_US) {
+                log_append(cur_dmph); g_logged_dmph = cur_dmph;
+                last_log = now; change_us = 0;
+            }
+        } else {
+            change_us = 0;
+            if (cur_dmph > 0 && now - last_log > LOG_HB_US) {    /* heartbeat while moving */
+                log_append(cur_dmph); last_log = now;
+            }
         }
     }
 }
@@ -181,15 +286,17 @@ static esp_err_t status_get(httpd_req_t *req) {
     int link = (lf && (esp_timer_get_time() - lf) < STALE_US) ? 1 : 0;
     wifi_ap_record_t ap; int rssi = 0;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
-    char buf[420];
+    char buf[512];
     int len = snprintf(buf, sizeof(buf),
         "{\"speed_mph\":%.1f,\"speed_kmh\":%.2f,\"distance_mi\":%.3f,\"distance_m\":%.1f,"
         "\"steps_est\":%.0f,\"uptime_s\":%lld,\"raw_V\":%u,\"cmd\":\"0x%02X\",\"frames\":%lu,"
-        "\"link\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"ap_mode\":%s,\"heap\":%lu}",
+        "\"link\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"ap_mode\":%s,\"heap\":%lu,"
+        "\"log_records\":%lu,\"log_seg\":%d,\"time_synced\":%s,\"epoch\":%lld}",
         sp, sp * 1.60934, mi, m, m / STRIDE_M,
         (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
         V, cmd, (unsigned long)fr, link ? "ok" : "stale", rssi, g_ip,
-        g_ap_active ? "true" : "false", (unsigned long)esp_get_free_heap_size());
+        g_ap_active ? "true" : "false", (unsigned long)esp_get_free_heap_size(),
+        (unsigned long)g_log_records, g_seg, g_time_synced ? "true" : "false", (long long)time(NULL));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, buf, len);
@@ -201,7 +308,105 @@ static esp_err_t reset_get(httpd_req_t *req) {
     g_dist_mi = 0.0;
     taskEXIT_CRITICAL(&mux);
     nvs_save_odo(0.0);
-    httpd_resp_sendstr(req, "reset ok");
+    httpd_resp_sendstr(req, "odometer reset");
+    return ESP_OK;
+}
+
+/* stream the whole circular log as CSV (oldest->newest): epoch,utc,mph */
+static esp_err_t logcsv_get(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/csv");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=walk.csv");
+    httpd_resp_sendstr_chunk(req, "epoch,utc,mph\n");
+    xSemaphoreTake(g_log_mux, portMAX_DELAY);
+    if (g_logf) fflush(g_logf);
+    char p[24], line[64]; struct tm tmv; logrec_t r;
+    for (int k = 1; k <= LOG_SEGS; k++) {           /* (g_seg+1) = oldest ... g_seg = newest */
+        seg_path((g_seg + k) % LOG_SEGS, p, sizeof(p));
+        FILE *rf = fopen(p, "rb");
+        if (!rf) continue;
+        while (fread(&r, 1, sizeof(r), rf) == sizeof(r)) {
+            uint8_t *b = (uint8_t *)&r, s = 0; for (int i = 0; i < 7; i++) s += b[i];
+            if (s != r.ck) continue;
+            char iso[24] = "";
+            if (r.ts) { time_t t = r.ts; gmtime_r(&t, &tmv); strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &tmv); }
+            int nn = snprintf(line, sizeof(line), "%lu,%s,%.1f\n", (unsigned long)r.ts, iso, r.dmph / 10.0);
+            httpd_resp_send_chunk(req, line, nn);
+        }
+        fclose(rf);
+    }
+    xSemaphoreGive(g_log_mux);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+/* reconstruct hours + miles from the log (totals + per-day for the last 60 days) */
+static esp_err_t stats_get(httpd_req_t *req) {
+    double total_mi = 0; long total_s = 0, records = 0;
+    long day_now = (time(NULL) > (time_t)EPOCH_VALID) ? (time(NULL) / 86400) : 0;
+    static double day_mi[60]; static long day_s[60];
+    memset(day_mi, 0, sizeof(day_mi)); memset(day_s, 0, sizeof(day_s));
+
+    xSemaphoreTake(g_log_mux, portMAX_DELAY);
+    if (g_logf) fflush(g_logf);
+    char p[24]; logrec_t r, prev; bool have = false;
+    for (int k = 1; k <= LOG_SEGS; k++) {
+        seg_path((g_seg + k) % LOG_SEGS, p, sizeof(p));
+        FILE *rf = fopen(p, "rb");
+        if (!rf) continue;
+        while (fread(&r, 1, sizeof(r), rf) == sizeof(r)) {
+            uint8_t *b = (uint8_t *)&r, s = 0; for (int i = 0; i < 7; i++) s += b[i];
+            if (s != r.ck) continue;
+            records++;
+            if (have && prev.ts >= EPOCH_VALID && r.ts >= prev.ts) {
+                long dt = (long)r.ts - (long)prev.ts;
+                if (prev.dmph > 0 && dt > 0 && dt <= LOG_GAP_CAP_S) {   /* ignore power gaps */
+                    double miles = (prev.dmph / 10.0) * dt / 3600.0;
+                    total_mi += miles; total_s += dt;
+                    if (day_now) {
+                        long idx = (prev.ts / 86400) - (day_now - 59);
+                        if (idx >= 0 && idx < 60) { day_mi[idx] += miles; day_s[idx] += dt; }
+                    }
+                }
+            }
+            prev = r; have = true;
+        }
+        fclose(rf);
+    }
+    xSemaphoreGive(g_log_mux);
+
+    char *out = malloc(4096);
+    if (!out) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
+    int o = snprintf(out, 4096,
+        "{\"total_hours\":%.3f,\"total_miles\":%.3f,\"records\":%ld,\"synced\":%s,\"days\":[",
+        total_s / 3600.0, total_mi, records, g_time_synced ? "true" : "false");
+    bool first = true;
+    for (int i = 0; i < 60 && day_now; i++) {
+        if (day_s[i] == 0) continue;
+        time_t t = (time_t)((day_now - 59 + i) * 86400); struct tm tmv; gmtime_r(&t, &tmv);
+        char d[11]; strftime(d, sizeof(d), "%Y-%m-%d", &tmv);
+        o += snprintf(out + o, 4096 - o, "%s{\"d\":\"%s\",\"hours\":%.3f,\"miles\":%.3f}",
+                      first ? "" : ",", d, day_s[i] / 3600.0, day_mi[i]);
+        first = false;
+        if (o > 3900) break;
+    }
+    o += snprintf(out + o, 4096 - o, "]}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, out, o);
+    free(out);
+    return ESP_OK;
+}
+
+static esp_err_t logreset_get(httpd_req_t *req) {
+    xSemaphoreTake(g_log_mux, portMAX_DELAY);
+    if (g_logf) { fclose(g_logf); g_logf = NULL; }
+    char p[24];
+    for (int i = 0; i < LOG_SEGS; i++) { seg_path(i, p, sizeof(p)); remove(p); }
+    g_seg = 0; g_seg_bytes = 0; g_log_records = 0; g_logged_dmph = -1;
+    seg_path(0, p, sizeof(p)); g_logf = fopen(p, "ab");
+    nvs_save_seg(0);
+    xSemaphoreGive(g_log_mux);
+    httpd_resp_sendstr(req, "log cleared");
     return ESP_OK;
 }
 
@@ -247,8 +452,6 @@ static void urldecode(char *s) {
     }
     *o = 0;
 }
-
-/* setup AP: save new WiFi creds and reboot */
 static esp_err_t wifi_post(httpd_req_t *req) {
     char buf[256];
     int len = MINI(req->content_len, (int)sizeof(buf) - 1);
@@ -278,29 +481,32 @@ static const char PAGE[] =
 "a{color:#6cf}.stale{color:#e55}small{opacity:.5}</style>"
 "<h2>&#128694; Walking Pad</h2>"
 "<div class=big id=spd>--</div><div class=u>mph (<span id=kmh>--</span> km/h)</div>"
-"<div class=row><div class=card><div class=big id=dist>--</div><div class=u>miles</div></div>"
+"<div class=row><div class=card><div class=big id=dist>--</div><div class=u>miles (odo)</div></div>"
 "<div class=card><div class=big id=steps>--</div><div class=u>steps (est)</div></div></div>"
+"<div class=row><div class=card><div class=big id=thrs>--</div><div class=u>total hours</div></div>"
+"<div class=card><div class=big id=tmi>--</div><div class=u>total miles (log)</div></div></div>"
 "<div class=u id=meta style=margin-top:1rem></div>"
-"<div style=margin-top:1rem><button onclick=\"fetch('/reset')\">reset distance</button></div>"
+"<div style=margin-top:1rem><a href=/log.csv>download log CSV</a> &nbsp; <a href=/stats>stats JSON</a></div>"
+"<div style=margin-top:1rem><button onclick=\"fetch('/reset')\">reset odometer</button></div>"
 "<div style=margin-top:1.5rem><small>firmware update (.bin):</small><br>"
-"<input type=file id=fw><button onclick=up()>flash</button> "
-"&nbsp;<a href=/setup>wifi setup</a></div>"
+"<input type=file id=fw><button onclick=up()>flash</button> &nbsp;<a href=/setup>wifi setup</a></div>"
 "<script>async function u(){try{let d=await(await fetch('/status')).json();"
 "spd.textContent=d.speed_mph.toFixed(1);kmh.textContent=d.speed_kmh.toFixed(2);"
 "dist.textContent=d.distance_mi.toFixed(3);steps.textContent=d.steps_est;"
-"meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' up '+d.uptime_s+'s';"
+"meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' log='+d.log_records+' up '+d.uptime_s+'s';"
 "meta.className=d.link=='ok'?'u':'u stale';}catch(e){meta.textContent='no connection';}}"
+"async function s(){try{let d=await(await fetch('/stats')).json();"
+"thrs.textContent=d.total_hours.toFixed(1);tmi.textContent=d.total_miles.toFixed(2);}catch(e){}}"
 "async function up(){let f=fw.files[0];if(!f){alert('pick a .bin');return;}"
 "if(!confirm('flash '+f.name+' ('+f.size+' bytes)?'))return;"
 "let r=await fetch('/update',{method:'POST',body:f});alert(await r.text());}"
-"setInterval(u,500);u();</script>";
+"setInterval(u,500);u();setInterval(s,10000);s();</script>";
 
 static esp_err_t root_get(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
-
 static const char SETUP[] =
 "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
 "<title>WiFi setup</title><style>body{font-family:system-ui;background:#111;color:#eee;text-align:center;padding:2rem}"
@@ -309,7 +515,6 @@ static const char SETUP[] =
 "<input name=ssid placeholder=SSID maxlength=32 required>"
 "<input name=pass placeholder=password type=password maxlength=63>"
 "<button>save &amp; reboot</button></form>";
-
 static esp_err_t setup_get(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, SETUP, HTTPD_RESP_USE_STRLEN);
@@ -322,16 +527,19 @@ static void start_http(void) {
     httpd_handle_t s = NULL;
     httpd_config_t c = HTTPD_DEFAULT_CONFIG();
     c.stack_size = 8192;
-    c.max_uri_handlers = 10;
+    c.max_uri_handlers = 12;
     c.lru_purge_enable = true;
     if (httpd_start(&s, &c) == ESP_OK) {
         httpd_uri_t h[] = {
-            { .uri = "/",       .method = HTTP_GET,  .handler = root_get   },
-            { .uri = "/status", .method = HTTP_GET,  .handler = status_get },
-            { .uri = "/reset",  .method = HTTP_GET,  .handler = reset_get  },
-            { .uri = "/setup",  .method = HTTP_GET,  .handler = setup_get  },
-            { .uri = "/update", .method = HTTP_POST, .handler = update_post},
-            { .uri = "/wifi",   .method = HTTP_POST, .handler = wifi_post  },
+            { .uri = "/",          .method = HTTP_GET,  .handler = root_get     },
+            { .uri = "/status",    .method = HTTP_GET,  .handler = status_get   },
+            { .uri = "/reset",     .method = HTTP_GET,  .handler = reset_get     },
+            { .uri = "/setup",     .method = HTTP_GET,  .handler = setup_get     },
+            { .uri = "/log.csv",   .method = HTTP_GET,  .handler = logcsv_get    },
+            { .uri = "/stats",     .method = HTTP_GET,  .handler = stats_get     },
+            { .uri = "/log/reset", .method = HTTP_GET,  .handler = logreset_get  },
+            { .uri = "/update",    .method = HTTP_POST, .handler = update_post   },
+            { .uri = "/wifi",      .method = HTTP_POST, .handler = wifi_post     },
         };
         for (int i = 0; i < (int)(sizeof(h) / sizeof(h[0])); i++) httpd_register_uri_handler(s, &h[i]);
         started = true;
@@ -339,7 +547,18 @@ static void start_http(void) {
     }
 }
 
-/* ------------------- WiFi ------------------- */
+/* ------------------- WiFi + time ------------------- */
+static void sntp_start(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, NTP_SERVER);
+    esp_sntp_init();
+    ESP_LOGI(TAG, "SNTP started (%s)", NTP_SERVER);
+}
+static void time_sync_cb(struct timeval *tv) { g_time_synced = true; ESP_LOGI(TAG, "time synced: %lld", (long long)time(NULL)); }
+
 static void start_setup_ap(void) {
     if (g_ap_active) return;
     g_ap_active = true;
@@ -353,7 +572,7 @@ static void start_setup_ap(void) {
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.channel = 1;
     esp_wifi_set_config(WIFI_IF_AP, &ap);
-    ota_mark_valid();   /* reachable via AP -> not bricked */
+    ota_mark_valid();
 }
 static void fallback_cb(void *arg) { if (!g_connected) start_setup_ap(); }
 
@@ -369,6 +588,7 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data) {
         g_connected = true;
         ESP_LOGI(TAG, "got IP %s  ->  http://%s.local/  (or http://%s/)", g_ip, HOSTNAME, g_ip);
         ota_mark_valid();
+        sntp_start();
     }
 }
 
@@ -389,6 +609,7 @@ static void wifi_start(void) {
     ESP_ERROR_CHECK(esp_wifi_init(&ic));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi, NULL, NULL));
+    sntp_set_time_sync_notification_cb(&time_sync_cb);
 
     char ssid[33], pass[65];
     if (!nvs_load_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
@@ -426,11 +647,14 @@ void app_main(void) {
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase(); nvs_flash_init();
     }
+    setenv("TZ", "UTC0", 1); tzset();       /* log in UTC; apply your TZ when reconstructing */
+    g_log_mux = xSemaphoreCreateMutex();
+    log_fs_init();
     g_dist_mi = nvs_load_odo();
     pad_uart_start();
     wifi_start();
-    start_http();     /* binds 0.0.0.0 — serves on STA and/or AP */
+    start_http();
     mdns_start();
-    ESP_LOGI(TAG, "walkingpad-bridge up: UART2 RX=GPIO%d @ %d 8N1, odo=%.3f mi",
-             PAD_RX_GPIO, PAD_BAUD, g_dist_mi);
+    ESP_LOGI(TAG, "walkingpad-bridge up: UART2 RX=GPIO%d @ %d 8N1, odo=%.3f mi, log=%lu recs (seg %d)",
+             PAD_RX_GPIO, PAD_BAUD, g_dist_mi, (unsigned long)g_log_records, g_seg);
 }

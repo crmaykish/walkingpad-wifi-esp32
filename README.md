@@ -17,6 +17,7 @@ was no telemetry interface. This project adds one.
 - JSON: `GET /status` → `speed_mph`, `speed_kmh`, `distance_mi`, `distance_m`, `steps_est`,
   `uptime_s`, `raw_V`, `cmd`, `frames`, `link` (`ok`/`stale`), `rssi`, `ip`, `ap_mode`, `heap`
 - Reset odometer: `GET /reset`
+- **History:** `GET /stats` (JSON — total hours/miles + per-day) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
 
 **Update firmware over WiFi** (no disassembly):
 ```bash
@@ -134,10 +135,12 @@ logic GND to the AC pins), so tying a grounded FTDI/PC to it during bench work i
 - **mDNS** → `walkingpad.local`.
 - **WiFi setup-AP fallback** (`walkingpad-setup` / `walkingpad`) → `/setup` form → NVS creds.
 - **Odometer persisted to NVS** (survives reboots).
+- **Persistent event log** on a LittleFS partition — see [Persistent logging](#persistent-logging).
 
-**Partition layout** (4 MB flash): `factory` (golden, USB-only recovery) + `ota_0` + `ota_1`
-(OTA ping-pongs between them). `CONFIG_PARTITION_TABLE_TWO_OTA` + `FLASHSIZE_4MB` +
-`APP_ROLLBACK_ENABLE` (all in `sdkconfig.defaults`).
+**Partition layout** (4 MB flash, custom `partitions.csv`): `factory` (golden, USB-only
+recovery) + `ota_0` + `ota_1` (OTA ping-pongs between them) + **`storage`** (~960 KB LittleFS
+for the event log). `FLASHSIZE_4MB` + `APP_ROLLBACK_ENABLE` in `sdkconfig.defaults`. Changing
+this table (e.g. resizing `storage`) needs a **USB** flash — it can't be done over OTA.
 
 **WiFi credentials** live in gitignored **`main/wifi_secrets.h`** — two `#define`s
 (`WIFI_SSID` / `WIFI_PASS`) — so they're never committed. If that file is missing (e.g. a
@@ -171,6 +174,26 @@ ESP32_PORT=/dev/ttyUSB1 ESP32_FLASH_BAUD=115200 \
 See [Quick reference](#quick-reference). Runs from `ota_0`/`ota_1`; `factory` is untouched.
 
 ---
+
+## Persistent logging
+
+Every settled **speed change** is written as an 8-byte record `{epoch, 0.1 mph, flags, checksum}`
+to a **segmented circular log** on the `storage` LittleFS partition, plus a heartbeat every
+~4 min while moving (so a power cut loses at most a few minutes). Time comes from **SNTP** (UTC).
+
+The log is `LOG_SEGS` (6) files × `LOG_SEG_BYTES` (100 KB) ≈ 600 KB. When the active segment
+fills, it advances and **erases the next one — dropping the oldest data**. So it's bounded
+forever and never fails silently: ~75k records ≈ several years (at ~50 changes/day, ~4 yrs).
+
+- `GET /stats` → `{total_hours, total_miles, records, days:[{d,hours,miles}]}` (per-day for the
+  last 60 days; power-off gaps filtered by a 10-min cap so they aren't counted as walking).
+- `GET /log.csv` → the raw log as `epoch,utc,mph`, oldest→newest. Reconstruct however you like:
+  between consecutive records speed is constant, so `hours += Δt`, `miles += mph·Δt`.
+- `GET /log/reset` → wipe the log.
+- Records logged before the first NTP sync (e.g. an idle boot) have `epoch=0` and are skipped by
+  `/stats`. Logging is UTC — apply your timezone when reconstructing.
+- Tunables at the top of `main/walkingpad_bridge.c`: `LOG_SEGS`, `LOG_SEG_BYTES`, `LOG_HB_US`,
+  `LOG_GAP_CAP_S`.
 
 ## Bench debugging tools (`tools/`)
 
