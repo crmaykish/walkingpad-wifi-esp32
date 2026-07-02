@@ -15,12 +15,14 @@ was no telemetry interface. This project adds one.
 **Read telemetry** (any device on the LAN):
 - Dashboard: **http://walkingpad.local/** (or the DHCP IP; was `192.168.1.223`)
 - JSON: `GET /status` → `speed_mph`, `speed_kmh`, `distance_mi`, `distance_m`, `steps_est`,
+  `session_mi`, `session_steps` (live, since last power-on — reset to 0 on every boot),
   `uptime_s`, `raw_V`, `cmd`, `frames`, `link` (`ok`/`stale`), `rssi`, `ip`, `ap_mode`, `heap`
 - Reset odometer: `GET /reset`
 - **History:** `GET /stats` (JSON — today / this week / this month / lifetime hours·miles·steps, plus per-day) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
 
-The dashboard shows **current speed** up top, then **Today / This Week / This Month** rows
-(miles · avg mph · steps each), then **Lifetime** (hours · miles · steps). Day/week/month
+The dashboard shows **current speed** up top with a live **this-session** miles/steps row
+(both from `/status`, updating every 0.5 s, reset on each power-on), then **Today / This Week /
+This Month** rows (miles · avg mph · steps each), then **Lifetime** (hours · miles · steps). Day/week/month
 buckets follow the **US Eastern** wall calendar (`EST5EDT`, DST-aware) so "today" rolls over
 at local midnight; weeks start Sunday. The stored log stays in UTC epoch (`/log.csv` is UTC).
 

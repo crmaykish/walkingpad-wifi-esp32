@@ -82,7 +82,8 @@ static const char *TAG = "pad";
 
 static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static float    g_speed_mph = 0.0f;
-static double   g_dist_mi   = 0.0;
+static double   g_dist_mi   = 0.0;    /* persisted odometer (survives reboots, resettable) */
+static double   g_sess_mi   = 0.0;    /* live session distance since power-on (starts at 0) */
 static uint16_t g_rawV = 0;
 static uint8_t  g_cmd  = 0;
 static uint32_t g_frames = 0;
@@ -257,7 +258,9 @@ static void uart_task(void *arg) {
         int64_t dt = now - last_int; last_int = now;
         taskENTER_CRITICAL(&mux);
         if (g_last_frame_us && (now - g_last_frame_us) > STALE_US) g_speed_mph = 0.0f;
-        g_dist_mi += (double)g_speed_mph * ((double)dt / 1e6) / 3600.0;
+        double inc = (double)g_speed_mph * ((double)dt / 1e6) / 3600.0;
+        g_dist_mi += inc;
+        g_sess_mi += inc;
         float cur = g_speed_mph;
         double snapshot = g_dist_mi;
         taskEXIT_CRITICAL(&mux);
@@ -284,21 +287,22 @@ static void uart_task(void *arg) {
 
 /* ------------------- HTTP ------------------- */
 static esp_err_t status_get(httpd_req_t *req) {
-    float sp; double mi; uint16_t V; uint8_t cmd; uint32_t fr; int64_t lf;
+    float sp; double mi, smi; uint16_t V; uint8_t cmd; uint32_t fr; int64_t lf;
     taskENTER_CRITICAL(&mux);
-    sp = g_speed_mph; mi = g_dist_mi; V = g_rawV; cmd = g_cmd; fr = g_frames; lf = g_last_frame_us;
+    sp = g_speed_mph; mi = g_dist_mi; smi = g_sess_mi; V = g_rawV; cmd = g_cmd; fr = g_frames; lf = g_last_frame_us;
     taskEXIT_CRITICAL(&mux);
-    double m = mi * 1609.34;
+    double m = mi * 1609.34, sm = smi * 1609.34;
     int link = (lf && (esp_timer_get_time() - lf) < STALE_US) ? 1 : 0;
     wifi_ap_record_t ap; int rssi = 0;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
-    char buf[512];
+    char buf[640];
     int len = snprintf(buf, sizeof(buf),
         "{\"speed_mph\":%.1f,\"speed_kmh\":%.2f,\"distance_mi\":%.3f,\"distance_m\":%.1f,"
-        "\"steps_est\":%.0f,\"uptime_s\":%lld,\"raw_V\":%u,\"cmd\":\"0x%02X\",\"frames\":%lu,"
+        "\"steps_est\":%.0f,\"session_mi\":%.3f,\"session_steps\":%.0f,"
+        "\"uptime_s\":%lld,\"raw_V\":%u,\"cmd\":\"0x%02X\",\"frames\":%lu,"
         "\"link\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"ap_mode\":%s,\"heap\":%lu,"
         "\"log_records\":%lu,\"log_seg\":%d,\"time_synced\":%s,\"epoch\":%lld}",
-        sp, sp * 1.60934, mi, m, m / STRIDE_M,
+        sp, sp * 1.60934, mi, m, m / STRIDE_M, smi, sm / STRIDE_M,
         (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
         V, cmd, (unsigned long)fr, link ? "ok" : "stale", rssi, g_ip,
         g_ap_active ? "true" : "false", (unsigned long)esp_get_free_heap_size(),
@@ -524,6 +528,9 @@ static const char PAGE[] =
 "a{color:#6cf}.stale{color:#e55}small{opacity:.5}</style>"
 "<h2>&#128694; Walking Pad</h2>"
 "<div class=big id=spd>--</div><div class=u>mph now (<span id=kmh>--</span> km/h)</div>"
+"<div class=row style=margin-top:.7rem>"
+"<div class=card><div class=big id=s_mi>--</div><div class=u>miles this session</div></div>"
+"<div class=card><div class=big id=s_st>--</div><div class=u>steps this session</div></div></div>"
 "<h3 class=sec>Today</h3><div class=row>"
 "<div class=card><div class=big id=d_mi>--</div><div class=u>miles</div></div>"
 "<div class=card><div class=big id=d_av>--</div><div class=u>avg mph</div></div>"
@@ -550,6 +557,7 @@ static const char PAGE[] =
 "document.getElementById(p+'_st').textContent=o.steps.toFixed(0);}"
 "async function u(){try{let d=await(await fetch('/status')).json();"
 "spd.textContent=d.speed_mph.toFixed(1);kmh.textContent=d.speed_kmh.toFixed(2);"
+"s_mi.textContent=d.session_mi.toFixed(2);s_st.textContent=d.session_steps.toFixed(0);"
 "meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' odo='+d.distance_mi.toFixed(2)+'mi log='+d.log_records+' up '+d.uptime_s+'s';"
 "meta.className=d.link=='ok'?'u':'u stale';}catch(e){meta.textContent='no connection';}}"
 "async function s(){try{let d=await(await fetch('/stats')).json();"
