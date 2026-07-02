@@ -59,6 +59,9 @@
 #define HOSTNAME    "walkingpad"       /* -> http://walkingpad.local/ */
 #define STRIDE_M    0.67               /* metres/step (rough; tune to taste) */
 #define NTP_SERVER  "pool.ntp.org"
+#define LOCAL_TZ    "EST5EDT,M3.2.0/2,M11.1.0/2"  /* US Eastern, DST-aware: day/week/month
+                                                     buckets use this so they match the wall
+                                                     calendar (records still store UTC epoch) */
 /* --------------------------------------------------- */
 
 #define PAD_UART        UART_NUM_2
@@ -342,10 +345,31 @@ static esp_err_t logcsv_get(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* reconstruct hours + miles from the log (totals + per-day for the last 60 days) */
+/* days since the Unix epoch for a civil (Y,M,D) date — Howard Hinnant's algorithm.
+   Lets us bucket by LOCAL calendar day/week/month without epoch/86400 rounding to UTC. */
+static long days_from_civil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (long)doe - 719468;
+}
+
+/* reconstruct hours+miles+steps from the log: today / this week / this month / lifetime,
+   bucketed by the LOCAL (Eastern) calendar, plus a per-day array for the last 60 days */
 static esp_err_t stats_get(httpd_req_t *req) {
-    double total_mi = 0; long total_s = 0, records = 0;
-    long day_now = (time(NULL) > (time_t)EPOCH_VALID) ? (time(NULL) / 86400) : 0;
+    time_t now = time(NULL);
+    bool synced = now > (time_t)EPOCH_VALID;
+    long ldn_now = 0, wk_now = 0, ym_now = 0;
+    if (synced) {
+        struct tm lt; localtime_r(&now, &lt);
+        ldn_now = days_from_civil(lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+        wk_now  = (ldn_now + 4) / 7;                 /* weeks start Sunday (epoch day 0 = Thu) */
+        ym_now  = lt.tm_year * 12 + lt.tm_mon;
+    }
+    double tot_mi = 0, d_mi = 0, w_mi = 0, m_mi = 0;
+    long   tot_s = 0,  d_s = 0,  w_s = 0,  m_s = 0, records = 0;
     static double day_mi[60]; static long day_s[60];
     memset(day_mi, 0, sizeof(day_mi)); memset(day_s, 0, sizeof(day_s));
 
@@ -364,9 +388,14 @@ static esp_err_t stats_get(httpd_req_t *req) {
                 long dt = (long)r.ts - (long)prev.ts;
                 if (prev.dmph > 0 && dt > 0 && dt <= LOG_GAP_CAP_S) {   /* ignore power gaps */
                     double miles = (prev.dmph / 10.0) * dt / 3600.0;
-                    total_mi += miles; total_s += dt;
-                    if (day_now) {
-                        long idx = (prev.ts / 86400) - (day_now - 59);
+                    tot_mi += miles; tot_s += dt;
+                    if (synced) {
+                        time_t pts = prev.ts; struct tm pt; localtime_r(&pts, &pt);
+                        long ldn = days_from_civil(pt.tm_year + 1900, pt.tm_mon + 1, pt.tm_mday);
+                        if (ldn == ldn_now)                        { d_mi += miles; d_s += dt; }
+                        if ((ldn + 4) / 7 == wk_now)               { w_mi += miles; w_s += dt; }
+                        if (pt.tm_year * 12 + pt.tm_mon == ym_now) { m_mi += miles; m_s += dt; }
+                        long idx = ldn - (ldn_now - 59);
                         if (idx >= 0 && idx < 60) { day_mi[idx] += miles; day_s[idx] += dt; }
                     }
                 }
@@ -377,22 +406,31 @@ static esp_err_t stats_get(httpd_req_t *req) {
     }
     xSemaphoreGive(g_log_mux);
 
-    char *out = malloc(4096);
+    double spm = 1609.34 / STRIDE_M;   /* steps per mile */
+    char *out = malloc(6144);
     if (!out) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
-    int o = snprintf(out, 4096,
-        "{\"total_hours\":%.3f,\"total_miles\":%.3f,\"records\":%ld,\"synced\":%s,\"days\":[",
-        total_s / 3600.0, total_mi, records, g_time_synced ? "true" : "false");
+    int o = snprintf(out, 6144,
+        "{\"today\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
+        "\"week\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
+        "\"month\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
+        "\"total_hours\":%.3f,\"total_miles\":%.3f,\"total_steps\":%.0f,"
+        "\"records\":%ld,\"synced\":%s,\"days\":[",
+        d_s / 3600.0, d_mi, d_mi * spm,
+        w_s / 3600.0, w_mi, w_mi * spm,
+        m_s / 3600.0, m_mi, m_mi * spm,
+        tot_s / 3600.0, tot_mi, tot_mi * spm,
+        records, synced ? "true" : "false");
     bool first = true;
-    for (int i = 0; i < 60 && day_now; i++) {
+    for (int i = 0; i < 60 && synced; i++) {
         if (day_s[i] == 0) continue;
-        time_t t = (time_t)((day_now - 59 + i) * 86400); struct tm tmv; gmtime_r(&t, &tmv);
+        time_t t = (time_t)((ldn_now - 59 + i) * 86400); struct tm tmv; gmtime_r(&t, &tmv);
         char d[11]; strftime(d, sizeof(d), "%Y-%m-%d", &tmv);
-        o += snprintf(out + o, 4096 - o, "%s{\"d\":\"%s\",\"hours\":%.3f,\"miles\":%.3f}",
+        o += snprintf(out + o, 6144 - o, "%s{\"d\":\"%s\",\"hours\":%.3f,\"miles\":%.3f}",
                       first ? "" : ",", d, day_s[i] / 3600.0, day_mi[i]);
         first = false;
-        if (o > 3900) break;
+        if (o > 5900) break;
     }
-    o += snprintf(out + o, 4096 - o, "]}");
+    o += snprintf(out + o, 6144 - o, "]}");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, out, o);
@@ -477,29 +515,47 @@ static const char PAGE[] =
 "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
 "<title>Walking Pad</title><style>"
 "body{font-family:system-ui,sans-serif;background:#111;color:#eee;text-align:center;margin:0;padding:2rem}"
-".big{font-size:4rem;font-weight:700;margin:.15em}.u{opacity:.6;font-size:1rem}"
-".row{display:flex;justify-content:center;gap:1.5rem;margin-top:1rem;flex-wrap:wrap}"
-".card{background:#1c1c1c;padding:1rem 1.5rem;border-radius:12px}"
+".big{font-size:4rem;font-weight:700;margin:.15em}.u{opacity:.6;font-size:.95rem}"
+"h3.sec{margin:1.5rem 0 .3rem;opacity:.55;font-weight:600;letter-spacing:.08em;text-transform:uppercase;font-size:.8rem}"
+".row{display:flex;justify-content:center;gap:1rem;margin-top:.4rem;flex-wrap:wrap}"
+".card{background:#1c1c1c;padding:.8rem 1.3rem;border-radius:12px;min-width:5rem}"
+".card .big{font-size:2rem;margin:.1em}"
 "button{margin:.4rem;padding:.5rem 1rem;border:0;border-radius:8px;background:#2d6;color:#000;font-weight:600}"
 "a{color:#6cf}.stale{color:#e55}small{opacity:.5}</style>"
 "<h2>&#128694; Walking Pad</h2>"
-"<div class=big id=spd>--</div><div class=u>mph (<span id=kmh>--</span> km/h)</div>"
-"<div class=row><div class=card><div class=big id=dist>--</div><div class=u>miles (odo)</div></div>"
-"<div class=card><div class=big id=steps>--</div><div class=u>steps (est)</div></div></div>"
-"<div class=row><div class=card><div class=big id=thrs>--</div><div class=u>total hours</div></div>"
-"<div class=card><div class=big id=tmi>--</div><div class=u>total miles (log)</div></div></div>"
+"<div class=big id=spd>--</div><div class=u>mph now (<span id=kmh>--</span> km/h)</div>"
+"<h3 class=sec>Today</h3><div class=row>"
+"<div class=card><div class=big id=d_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=d_av>--</div><div class=u>avg mph</div></div>"
+"<div class=card><div class=big id=d_st>--</div><div class=u>steps</div></div></div>"
+"<h3 class=sec>This Week</h3><div class=row>"
+"<div class=card><div class=big id=w_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=w_av>--</div><div class=u>avg mph</div></div>"
+"<div class=card><div class=big id=w_st>--</div><div class=u>steps</div></div></div>"
+"<h3 class=sec>This Month</h3><div class=row>"
+"<div class=card><div class=big id=m_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=m_av>--</div><div class=u>avg mph</div></div>"
+"<div class=card><div class=big id=m_st>--</div><div class=u>steps</div></div></div>"
+"<h3 class=sec>Lifetime</h3><div class=row>"
+"<div class=card><div class=big id=t_hr>--</div><div class=u>hours</div></div>"
+"<div class=card><div class=big id=t_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=t_st>--</div><div class=u>steps</div></div></div>"
 "<div class=u id=meta style=margin-top:1rem></div>"
 "<div style=margin-top:1rem><a href=/log.csv>download log CSV</a> &nbsp; <a href=/stats>stats JSON</a></div>"
 "<div style=margin-top:1rem><button onclick=\"fetch('/reset')\">reset odometer</button></div>"
 "<div style=margin-top:1.5rem><small>firmware update (.bin):</small><br>"
 "<input type=file id=fw><button onclick=up()>flash</button> &nbsp;<a href=/setup>wifi setup</a></div>"
-"<script>async function u(){try{let d=await(await fetch('/status')).json();"
+"<script>function fill(p,o){document.getElementById(p+'_mi').textContent=o.miles.toFixed(2);"
+"document.getElementById(p+'_av').textContent=(o.hours>0?o.miles/o.hours:0).toFixed(1);"
+"document.getElementById(p+'_st').textContent=o.steps.toFixed(0);}"
+"async function u(){try{let d=await(await fetch('/status')).json();"
 "spd.textContent=d.speed_mph.toFixed(1);kmh.textContent=d.speed_kmh.toFixed(2);"
-"dist.textContent=d.distance_mi.toFixed(3);steps.textContent=d.steps_est;"
-"meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' log='+d.log_records+' up '+d.uptime_s+'s';"
+"meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' odo='+d.distance_mi.toFixed(2)+'mi log='+d.log_records+' up '+d.uptime_s+'s';"
 "meta.className=d.link=='ok'?'u':'u stale';}catch(e){meta.textContent='no connection';}}"
 "async function s(){try{let d=await(await fetch('/stats')).json();"
-"thrs.textContent=d.total_hours.toFixed(1);tmi.textContent=d.total_miles.toFixed(2);}catch(e){}}"
+"fill('d',d.today);fill('w',d.week);fill('m',d.month);"
+"t_hr.textContent=d.total_hours.toFixed(1);t_mi.textContent=d.total_miles.toFixed(2);"
+"t_st.textContent=d.total_steps.toFixed(0);}catch(e){}}"
 "async function up(){let f=fw.files[0];if(!f){alert('pick a .bin');return;}"
 "if(!confirm('flash '+f.name+' ('+f.size+' bytes)?'))return;"
 "let r=await fetch('/update',{method:'POST',body:f});alert(await r.text());}"
@@ -650,7 +706,7 @@ void app_main(void) {
     if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase(); nvs_flash_init();
     }
-    setenv("TZ", "UTC0", 1); tzset();       /* log in UTC; apply your TZ when reconstructing */
+    setenv("TZ", LOCAL_TZ, 1); tzset();     /* records store UTC epoch; /stats buckets by local day */
     g_log_mux = xSemaphoreCreateMutex();
     log_fs_init();
     g_dist_mi = nvs_load_odo();

@@ -17,7 +17,12 @@ was no telemetry interface. This project adds one.
 - JSON: `GET /status` → `speed_mph`, `speed_kmh`, `distance_mi`, `distance_m`, `steps_est`,
   `uptime_s`, `raw_V`, `cmd`, `frames`, `link` (`ok`/`stale`), `rssi`, `ip`, `ap_mode`, `heap`
 - Reset odometer: `GET /reset`
-- **History:** `GET /stats` (JSON — total hours/miles + per-day) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
+- **History:** `GET /stats` (JSON — today / this week / this month / lifetime hours·miles·steps, plus per-day) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
+
+The dashboard shows **current speed** up top, then **Today / This Week / This Month** rows
+(miles · avg mph · steps each), then **Lifetime** (hours · miles · steps). Day/week/month
+buckets follow the **US Eastern** wall calendar (`EST5EDT`, DST-aware) so "today" rolls over
+at local midnight; weeks start Sunday. The stored log stays in UTC epoch (`/log.csv` is UTC).
 
 **Update firmware over WiFi** (no disassembly):
 ```bash
@@ -194,13 +199,18 @@ The log is `LOG_SEGS` (6) files × `LOG_SEG_BYTES` (100 KB) ≈ 600 KB. When the
 fills, it advances and **erases the next one — dropping the oldest data**. So it's bounded
 forever and never fails silently: ~75k records ≈ several years (at ~50 changes/day, ~4 yrs).
 
-- `GET /stats` → `{total_hours, total_miles, records, days:[{d,hours,miles}]}` (per-day for the
-  last 60 days; power-off gaps filtered by a 10-min cap so they aren't counted as walking).
-- `GET /log.csv` → the raw log as `epoch,utc,mph`, oldest→newest. Reconstruct however you like:
-  between consecutive records speed is constant, so `hours += Δt`, `miles += mph·Δt`.
+- `GET /stats` → `{today, week, month, total_hours, total_miles, total_steps, records, days:[…]}`
+  where `today`/`week`/`month` are each `{hours, miles, steps}`. Buckets follow the **US Eastern**
+  calendar (`LOCAL_TZ = EST5EDT`, DST-aware): `today` = local calendar day, `week` = Sun-start
+  week, `month` = calendar month. `days:[{d,hours,miles}]` is per-day (Eastern date) for the last
+  60 days. Power-off gaps are filtered by a 10-min cap so they aren't counted as walking. Steps are
+  derived from miles via `STRIDE_M` (steps ≈ miles·1609.34/STRIDE_M).
+- `GET /log.csv` → the raw log as `epoch,utc,mph`, oldest→newest (UTC, unaffected by `LOCAL_TZ`).
+  Reconstruct however you like: between consecutive records speed is constant, so
+  `hours += Δt`, `miles += mph·Δt`.
 - `GET /log/reset` → wipe the log.
 - Records logged before the first NTP sync (e.g. an idle boot) have `epoch=0` and are skipped by
-  `/stats`. Logging is UTC — apply your timezone when reconstructing.
+  `/stats`. Only the day/week/month **bucketing** is localized; stored timestamps stay UTC epoch.
 - `/stats` counts only up to the **last logged record**, so mid-walk it can trail the live
   `distance_mi` odometer (`/status`) by up to one heartbeat (~4 min). The odometer is the
   continuous live figure; `/stats` is the durable reconstructed history.
