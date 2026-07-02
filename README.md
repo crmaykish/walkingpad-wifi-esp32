@@ -22,7 +22,7 @@ was no telemetry interface. This project adds one.
 
 The dashboard shows **current speed** up top with a live **this-session** miles/steps row
 (both from `/status`, updating every 0.5 s, reset on each power-on), then **Today / This Week /
-This Month** rows (miles · avg mph · steps each), then **Lifetime** (hours · miles · steps). Day/week/month
+This Month** rows (miles · avg mph · steps each), then **Lifetime** (miles · hours · steps). Day/week/month
 buckets follow the **US Eastern** wall calendar (`EST5EDT`, DST-aware) so "today" rolls over
 at local midnight; weeks start Sunday. The stored log stays in UTC epoch (`/log.csv` is UTC).
 
