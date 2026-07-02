@@ -78,6 +78,11 @@
 #define EPOCH_VALID     1600000000UL   /* time() beyond this => NTP-synced */
 #define LOG_SEGS        6              /* circular log: this many segment files ... */
 #define LOG_SEG_BYTES   (100 * 1024)   /* ... of this size each (6*100K = 600K < 960K part) */
+/* --- gamification --- */
+#define GOAL_MI_DEFAULT 2.0            /* daily distance goal (mi); runtime-settable via /goal */
+#define STAT_DAYS       370            /* per-day window for records/streak (JSON days[] still 60) */
+#define MILESTONE_MI    25.0           /* lifetime-distance marker spacing (mi) */
+#define ACTIVE_MI       0.2            /* a day counts as "active" (filled dot) above this (mi) */
 
 static const char *TAG = "pad";
 #define MINI(a,b) ((a) < (b) ? (a) : (b))
@@ -87,6 +92,7 @@ static float    g_speed_mph = 0.0f;
 static double   g_dist_mi   = 0.0;    /* persisted odometer (survives reboots, resettable) */
 static double   g_sess_mi   = 0.0;    /* live session distance since power-on (starts at 0) */
 static double   g_sess_s    = 0.0;    /* live session MOVING seconds since power-on (speed>0) */
+static double   g_life_mi   = 0.0;    /* monotonic lifetime miles for milestones (NOT reset by /reset) */
 static uint16_t g_rawV = 0;
 static uint8_t  g_cmd  = 0;
 static uint32_t g_frames = 0;
@@ -156,6 +162,25 @@ static int nvs_load_seg(void) {
 static void nvs_save_seg(int s) {
     nvs_handle_t h;
     if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "logseg", (uint8_t)s); nvs_commit(h); nvs_close(h); }
+}
+/* generic small-value persistence for gamification state (namespace "cfg") */
+static double nvs_load_d(const char *key, double def) {
+    double v = def; nvs_handle_t h; size_t sz = sizeof(v);
+    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) { nvs_get_blob(h, key, &v, &sz); nvs_close(h); }
+    return v;
+}
+static void nvs_save_d(const char *key, double v) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) { nvs_set_blob(h, key, &v, sizeof(v)); nvs_commit(h); nvs_close(h); }
+}
+static uint32_t nvs_load_u32(const char *key) {
+    uint32_t v = 0; nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) { nvs_get_u32(h, key, &v); nvs_close(h); }
+    return v;
+}
+static void nvs_save_u32(const char *key, uint32_t v) {
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u32(h, key, v); nvs_commit(h); nvs_close(h); }
 }
 
 static void ota_mark_valid(void) {
@@ -264,13 +289,16 @@ static void uart_task(void *arg) {
         double inc = (double)g_speed_mph * ((double)dt / 1e6) / 3600.0;
         g_dist_mi += inc;
         g_sess_mi += inc;
+        g_life_mi += inc;                                        /* never reset */
         if (g_speed_mph > 0.0f) g_sess_s += (double)dt / 1e6;   /* moving time only */
         float cur = g_speed_mph;
         double snapshot = g_dist_mi;
+        double lifesnap = g_life_mi;
         taskEXIT_CRITICAL(&mux);
 
         if (now - last_save > ODO_SAVE_US && snapshot - last_saved > 0.005) {
-            nvs_save_odo(snapshot); last_saved = snapshot; last_save = now;
+            nvs_save_odo(snapshot); nvs_save_d("lifemi", lifesnap);
+            last_saved = snapshot; last_save = now;
         }
 
         int cur_dmph = (int)(cur * 10.0f + 0.5f);
@@ -365,7 +393,9 @@ static long days_from_civil(int y, unsigned m, unsigned d) {
 }
 
 /* reconstruct hours+miles+steps from the log: today / this week / this month / lifetime,
-   bucketed by the LOCAL (Eastern) calendar, plus a per-day array for the last 60 days */
+   bucketed by the LOCAL (Eastern) calendar; also computes the gamification "game" object
+   (goal, streak, personal-best records, week momentum, activity dots, milestone) and a
+   per-day array for the last 60 days. All-time records + longest streak persist in NVS. */
 static esp_err_t stats_get(httpd_req_t *req) {
     time_t now = time(NULL);
     bool synced = now > (time_t)EPOCH_VALID;
@@ -378,8 +408,9 @@ static esp_err_t stats_get(httpd_req_t *req) {
     }
     double tot_mi = 0, d_mi = 0, w_mi = 0, m_mi = 0;
     long   tot_s = 0,  d_s = 0,  w_s = 0,  m_s = 0, records = 0;
-    static double day_mi[60]; static long day_s[60];
+    static double day_mi[STAT_DAYS]; static long day_s[STAT_DAYS];
     memset(day_mi, 0, sizeof(day_mi)); memset(day_s, 0, sizeof(day_s));
+    const int today_idx = STAT_DAYS - 1;             /* today is the last per-day bucket */
 
     xSemaphoreTake(g_log_mux, portMAX_DELAY);
     if (g_logf) fflush(g_logf);
@@ -403,8 +434,8 @@ static esp_err_t stats_get(httpd_req_t *req) {
                         if (ldn == ldn_now)                        { d_mi += miles; d_s += dt; }
                         if ((ldn + 4) / 7 == wk_now)               { w_mi += miles; w_s += dt; }
                         if (pt.tm_year * 12 + pt.tm_mon == ym_now) { m_mi += miles; m_s += dt; }
-                        long idx = ldn - (ldn_now - 59);
-                        if (idx >= 0 && idx < 60) { day_mi[idx] += miles; day_s[idx] += dt; }
+                        long idx = ldn - (ldn_now - today_idx);
+                        if (idx >= 0 && idx < STAT_DAYS) { day_mi[idx] += miles; day_s[idx] += dt; }
                     }
                 }
             }
@@ -415,34 +446,120 @@ static esp_err_t stats_get(httpd_req_t *req) {
     xSemaphoreGive(g_log_mux);
 
     double spm = 1609.34 / STRIDE_M;   /* steps per mile */
-    char *out = malloc(6144);
+
+    /* ---------- gamification ---------- */
+    double goal_mi = nvs_load_d("goalmi", GOAL_MI_DEFAULT);
+    double b7_mi = 0, b30_mi = 0, bw_mi = 0;   /* best-day distance: last 7d / 30d / whole window */
+    long   b7_s = 0,  b30_s = 0,  bw_s = 0;    /* best-day time */
+    long   bw_mi_idx = today_idx, bw_s_idx = today_idx;
+    double lw_mi = 0;                          /* last calendar week miles */
+    for (int i = 0; i < STAT_DAYS; i++) {
+        int age = today_idx - i;               /* 0 = today */
+        if (day_mi[i] > bw_mi) { bw_mi = day_mi[i]; bw_mi_idx = i; }
+        if (day_s[i]  > bw_s)  { bw_s  = day_s[i];  bw_s_idx  = i; }
+        if (age < 7)  { if (day_mi[i] > b7_mi)  b7_mi  = day_mi[i]; if (day_s[i] > b7_s)  b7_s  = day_s[i]; }
+        if (age < 30) { if (day_mi[i] > b30_mi) b30_mi = day_mi[i]; if (day_s[i] > b30_s) b30_s = day_s[i]; }
+        if (synced && (ldn_now - age + 4) / 7 == wk_now - 1) lw_mi += day_mi[i];
+    }
+    /* streaks vs the daily goal — computed fresh from the window so they stay consistent when the
+       goal changes (window > any realistic streak; goal-relative, so NOT persisted like records):
+       streak_best = longest goal-met run; streak = current run ending today (today pending is ok) */
+    int streak = 0, streak_best = 0;
+    if (synced) {
+        int run = 0;
+        for (int i = 0; i < STAT_DAYS; i++) {
+            if (day_mi[i] >= goal_mi) { if (++run > streak_best) streak_best = run; }
+            else run = 0;
+        }
+        int i = today_idx;
+        if (day_mi[i] < goal_mi) i--;          /* today not met yet -> count back from yesterday */
+        for (; i >= 0 && day_mi[i] >= goal_mi; i--) streak++;
+        if (streak > streak_best) streak_best = streak;
+    }
+    /* 7-day activity dots (oldest -> newest) */
+    int dots[7];
+    for (int j = 0; j < 7; j++) { int i = today_idx - 6 + j; dots[j] = (i >= 0 && day_mi[i] >= ACTIVE_MI) ? 1 : 0; }
+    /* lifetime miles + next round-number milestone */
+    double life_mi = g_life_mi;
+    double ms_next = ((double)((long)(life_mi / MILESTONE_MI)) + 1.0) * MILESTONE_MI;
+
+    /* all-time records + longest streak: load, lazily bump, persist (rare writes) */
+    double allrec_mi = nvs_load_d("recdmi", 0.0);
+    long   allrec_mid = (long)nvs_load_u32("recdmid");
+    long   allrec_s   = (long)nvs_load_u32("recds");
+    long   allrec_sd  = (long)nvs_load_u32("recdsd");
+    bool today_record = synced && day_mi[today_idx] > 0 &&
+                        day_mi[today_idx] >= bw_mi && day_mi[today_idx] >= allrec_mi;
+    if (synced) {
+        if (bw_mi > allrec_mi + 1e-9) {
+            allrec_mi = bw_mi; allrec_mid = ldn_now - (today_idx - bw_mi_idx);
+            nvs_save_d("recdmi", allrec_mi); nvs_save_u32("recdmid", (uint32_t)allrec_mid);
+        }
+        if (bw_s > allrec_s) {
+            allrec_s = bw_s; allrec_sd = ldn_now - (today_idx - bw_s_idx);
+            nvs_save_u32("recds", (uint32_t)allrec_s); nvs_save_u32("recdsd", (uint32_t)allrec_sd);
+        }
+    }
+    char amid[11] = "", asd[11] = "";
+    if (allrec_mid) { time_t t = (time_t)(allrec_mid * 86400); struct tm tv; gmtime_r(&t, &tv); strftime(amid, sizeof(amid), "%Y-%m-%d", &tv); }
+    if (allrec_sd)  { time_t t = (time_t)(allrec_sd  * 86400); struct tm tv; gmtime_r(&t, &tv); strftime(asd,  sizeof(asd),  "%Y-%m-%d", &tv); }
+
+    char *out = malloc(8192);
     if (!out) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_FAIL; }
-    int o = snprintf(out, 6144,
+    int o = snprintf(out, 8192,
         "{\"today\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
         "\"week\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
         "\"month\":{\"hours\":%.3f,\"miles\":%.3f,\"steps\":%.0f},"
         "\"total_hours\":%.3f,\"total_miles\":%.3f,\"total_steps\":%.0f,"
-        "\"records\":%ld,\"synced\":%s,\"days\":[",
+        "\"records\":%ld,\"synced\":%s,"
+        "\"game\":{\"goal_mi\":%.2f,\"streak\":%d,\"streak_best\":%d,\"today_record\":%s,"
+        "\"best\":{\"d7\":{\"mi\":%.3f,\"s\":%ld},\"d30\":{\"mi\":%.3f,\"s\":%ld},"
+        "\"all\":{\"mi\":%.3f,\"mi_date\":\"%s\",\"s\":%ld,\"s_date\":\"%s\"}},"
+        "\"week_mi\":%.3f,\"lastweek_mi\":%.3f,"
+        "\"life_mi\":%.3f,\"milestone_step\":%.0f,\"milestone_next\":%.0f,"
+        "\"dots\":[%d,%d,%d,%d,%d,%d,%d]},\"days\":[",
         d_s / 3600.0, d_mi, d_mi * spm,
         w_s / 3600.0, w_mi, w_mi * spm,
         m_s / 3600.0, m_mi, m_mi * spm,
         tot_s / 3600.0, tot_mi, tot_mi * spm,
-        records, synced ? "true" : "false");
+        records, synced ? "true" : "false",
+        goal_mi, streak, streak_best, today_record ? "true" : "false",
+        b7_mi, b7_s, b30_mi, b30_s,
+        allrec_mi, amid, allrec_s, asd,
+        w_mi, lw_mi,
+        life_mi, (double)MILESTONE_MI, ms_next,
+        dots[0], dots[1], dots[2], dots[3], dots[4], dots[5], dots[6]);
     bool first = true;
-    for (int i = 0; i < 60 && synced; i++) {
-        if (day_s[i] == 0) continue;
-        time_t t = (time_t)((ldn_now - 59 + i) * 86400); struct tm tmv; gmtime_r(&t, &tmv);
+    for (int i = STAT_DAYS - 60; i < STAT_DAYS && synced; i++) {
+        if (i < 0 || day_s[i] == 0) continue;
+        long ldn = ldn_now - (today_idx - i);
+        time_t t = (time_t)(ldn * 86400); struct tm tmv; gmtime_r(&t, &tmv);
         char d[11]; strftime(d, sizeof(d), "%Y-%m-%d", &tmv);
-        o += snprintf(out + o, 6144 - o, "%s{\"d\":\"%s\",\"hours\":%.3f,\"miles\":%.3f}",
+        o += snprintf(out + o, 8192 - o, "%s{\"d\":\"%s\",\"hours\":%.3f,\"miles\":%.3f}",
                       first ? "" : ",", d, day_s[i] / 3600.0, day_mi[i]);
         first = false;
-        if (o > 5900) break;
+        if (o > 7900) break;
     }
-    o += snprintf(out + o, 6144 - o, "]}");
+    o += snprintf(out + o, 8192 - o, "]}");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, out, o);
     free(out);
+    return ESP_OK;
+}
+
+/* GET /goal -> read current daily goal; GET /goal?mi=2.5 -> set + persist (0.1..50 mi) */
+static esp_err_t goal_get(httpd_req_t *req) {
+    char q[64], v[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "mi", v, sizeof(v)) == ESP_OK) {
+        double mi = atof(v);
+        if (mi >= 0.1 && mi <= 50.0) nvs_save_d("goalmi", mi);
+    }
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "{\"goal_mi\":%.2f}", nvs_load_d("goalmi", GOAL_MI_DEFAULT));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, n);
     return ESP_OK;
 }
 
@@ -529,15 +646,23 @@ static const char PAGE[] =
 ".card{background:#1c1c1c;padding:.75rem 1rem;border-radius:12px;min-width:4.3rem}"
 ".card .big{font-size:2rem;margin:.1em}"
 "button{margin:.4rem;padding:.5rem 1rem;border:0;border-radius:8px;background:#2d6;color:#000;font-weight:600}"
-"a{color:#6cf}.stale{color:#e55}small{opacity:.5}</style>"
+"a{color:#6cf}.stale{color:#e55}small{opacity:.5}"
+".gm{font-size:1.05rem;margin-top:.5rem}"
+".bar{height:.5rem;background:#2a2a2a;border-radius:6px;overflow:hidden;max-width:20rem;margin:.35rem auto}"
+".bar>i{display:block;height:100%;width:0;background:#2d6;transition:width .4s}"
+".up{color:#2d6}.dn{color:#e88}.flat{opacity:.55}"
+"#dots{letter-spacing:.3rem;font-size:1.15rem;margin-top:.2rem}"
+"input[type=number]{width:4rem}</style>"
 "<h2>&#128694; Walking Pad</h2>"
 "<div class=big id=spd>--</div><div class=u>mph now (<span id=kmh>--</span> km/h)</div>"
+"<div class=gm id=streak></div>"
+"<div class=bar><i id=goalfill></i></div><div class=u id=goaltxt></div>"
 "<h3 class=sec>This Session</h3><div class=row>"
 "<div class=card><div class=big id=s_mi>--</div><div class=u>miles</div></div>"
 "<div class=card><div class=big id=s_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=s_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=s_st>--</div><div class=u>steps</div></div></div>"
-"<h3 class=sec>Today</h3><div class=row>"
+"<h3 class=sec>Today <span id=pr></span></h3><div class=row>"
 "<div class=card><div class=big id=d_mi>--</div><div class=u>miles</div></div>"
 "<div class=card><div class=big id=d_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=d_av>--</div><div class=u>avg mph</div></div>"
@@ -547,6 +672,7 @@ static const char PAGE[] =
 "<div class=card><div class=big id=w_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=w_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=w_st>--</div><div class=u>steps</div></div></div>"
+"<div class=u id=mom style=margin-top:.35rem></div><div id=dots></div>"
 "<h3 class=sec>This Month</h3><div class=row>"
 "<div class=card><div class=big id=m_mi>--</div><div class=u>miles</div></div>"
 "<div class=card><div class=big id=m_tm>--</div><div class=u>time</div></div>"
@@ -557,9 +683,20 @@ static const char PAGE[] =
 "<div class=card><div class=big id=t_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=t_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=t_st>--</div><div class=u>steps</div></div></div>"
+"<div class=u id=msln style=margin-top:.4rem></div><div class=bar><i id=msfill></i></div>"
+"<h3 class=sec>Best Day &mdash; distance</h3><div class=row>"
+"<div class=card><div class=big id=bd_7>--</div><div class=u>last 7d</div></div>"
+"<div class=card><div class=big id=bd_30>--</div><div class=u>last 30d</div></div>"
+"<div class=card><div class=big id=bd_all>--</div><div class=u id=bd_ald>all-time</div></div></div>"
+"<h3 class=sec>Longest Day &mdash; time</h3><div class=row>"
+"<div class=card><div class=big id=bt_7>--</div><div class=u>last 7d</div></div>"
+"<div class=card><div class=big id=bt_30>--</div><div class=u>last 30d</div></div>"
+"<div class=card><div class=big id=bt_all>--</div><div class=u id=bt_ald>all-time</div></div></div>"
 "<div class=u id=meta style=margin-top:1rem></div>"
 "<div style=margin-top:1rem><a href=/log.csv>download log CSV</a> &nbsp; <a href=/stats>stats JSON</a></div>"
-"<div style=margin-top:1rem><button onclick=\"fetch('/reset')\">reset odometer</button></div>"
+"<div style=margin-top:1rem class=u>daily goal <input id=goalin type=number step=0.1 min=0.1> mi "
+"<button style='padding:.3rem .6rem' onclick=setgoal()>set</button></div>"
+"<div style=margin-top:.6rem><button onclick=\"fetch('/reset')\">reset odometer</button></div>"
 "<div style=margin-top:1.5rem><small>firmware update (.bin):</small><br>"
 "<input type=file id=fw><button onclick=up()>flash</button> &nbsp;<a href=/setup>wifi setup</a></div>"
 "<script>function gid(i){return document.getElementById(i);}"
@@ -575,7 +712,27 @@ static const char PAGE[] =
 "meta.className=d.link=='ok'?'u':'u stale';}catch(e){meta.textContent='no connection';}}"
 "async function s(){try{let d=await(await fetch('/stats')).json();"
 "fill('d',d.today);fill('w',d.week);fill('m',d.month);"
-"fill('t',{miles:d.total_miles,hours:d.total_hours,steps:d.total_steps});}catch(e){}}"
+"fill('t',{miles:d.total_miles,hours:d.total_hours,steps:d.total_steps});game(d);}catch(e){}}"
+"function game(d){var g=d.game;if(!g)return;"
+"streak.textContent='\\u{1F525} '+g.streak+' day streak \\u00b7 best '+g.streak_best;"
+"var goal=g.goal_mi,tm=d.today.miles,pct=goal>0?Math.min(100,tm/goal*100):0;"
+"goalfill.style.width=pct+'%';"
+"goaltxt.textContent=tm.toFixed(2)+' / '+goal.toFixed(1)+' mi today'+(tm>=goal?' \\u2713':'');"
+"if(goalin.value=='')goalin.value=goal.toFixed(1);"
+"pr.textContent=g.today_record?' \\u{1F3C6} best day!':'';"
+"bd_7.textContent=g.best.d7.mi.toFixed(2);bd_30.textContent=g.best.d30.mi.toFixed(2);"
+"bd_all.textContent=g.best.all.mi.toFixed(2);bd_ald.textContent='all-time'+(g.best.all.mi_date?' \\u00b7 '+g.best.all.mi_date:'');"
+"bt_7.textContent=dur(g.best.d7.s/3600);bt_30.textContent=dur(g.best.d30.s/3600);"
+"bt_all.textContent=dur(g.best.all.s/3600);bt_ald.textContent='all-time'+(g.best.all.s_date?' \\u00b7 '+g.best.all.s_date:'');"
+"var lw=g.lastweek_mi,tw=g.week_mi;"
+"if(lw>0){var pp=Math.round((tw-lw)/lw*100);mom.textContent=(pp>=0?'\\u25b2 '+pp:'\\u25bc '+(-pp))+'% vs last week';mom.className='u '+(pp>0?'up':pp<0?'dn':'flat');}"
+"else{mom.textContent=tw>0?'first week \\u2014 keep it going':'';mom.className='u flat';}"
+"dots.textContent=g.dots.map(function(x){return x?'\\u25cf':'\\u25cb';}).join(' ');"
+"var life=g.life_mi,step=g.milestone_step,nx=g.milestone_next,prv=nx-step;"
+"var mp=step>0?Math.min(100,(life-prv)/step*100):0;"
+"msln.textContent=life.toFixed(1)+' mi lifetime \\u00b7 '+(nx-life).toFixed(1)+' to your '+nx+'-mi marker';"
+"msfill.style.width=mp+'%';}"
+"async function setgoal(){var v=parseFloat(goalin.value);if(!(v>0))return;await fetch('/goal?mi='+v);s();}"
 "async function up(){let f=fw.files[0];if(!f){alert('pick a .bin');return;}"
 "if(!confirm('flash '+f.name+' ('+f.size+' bytes)?'))return;"
 "let r=await fetch('/update',{method:'POST',body:f});alert(await r.text());}"
@@ -616,6 +773,7 @@ static void start_http(void) {
             { .uri = "/setup",     .method = HTTP_GET,  .handler = setup_get     },
             { .uri = "/log.csv",   .method = HTTP_GET,  .handler = logcsv_get    },
             { .uri = "/stats",     .method = HTTP_GET,  .handler = stats_get     },
+            { .uri = "/goal",      .method = HTTP_GET,  .handler = goal_get      },
             { .uri = "/log/reset", .method = HTTP_GET,  .handler = logreset_get  },
             { .uri = "/update",    .method = HTTP_POST, .handler = update_post   },
             { .uri = "/wifi",      .method = HTTP_POST, .handler = wifi_post     },
@@ -730,6 +888,8 @@ void app_main(void) {
     g_log_mux = xSemaphoreCreateMutex();
     log_fs_init();
     g_dist_mi = nvs_load_odo();
+    g_life_mi = nvs_load_d("lifemi", -1.0);          /* seed once from best available figure */
+    if (g_life_mi < 0.0) { g_life_mi = g_dist_mi; nvs_save_d("lifemi", g_life_mi); }
     pad_uart_start();
     wifi_start();
     start_http();

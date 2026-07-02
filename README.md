@@ -19,7 +19,8 @@ was no telemetry interface. This project adds one.
   boot; `session_s` is *moving* seconds, so `session_mi / (session_s/3600)` is the session avg mph),
   `uptime_s`, `raw_V`, `cmd`, `frames`, `link` (`ok`/`stale`), `rssi`, `ip`, `ap_mode`, `heap`
 - Reset odometer: `GET /reset`
-- **History:** `GET /stats` (JSON — today / this week / this month / lifetime hours·miles·steps, plus per-day) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
+- **History:** `GET /stats` (JSON — today / this week / this month / lifetime hours·miles·steps, plus per-day, plus the `game` object below) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
+- **Daily goal:** `GET /goal` reads it; `GET /goal?mi=2.5` sets it (0.1–50 mi, persisted).
 
 The dashboard shows **current speed** up top, then a consistent **4-column grid** — *miles ·
 time · avg mph · steps* — for **This Session / Today / This Week / This Month / Lifetime**.
@@ -27,6 +28,20 @@ The Session row is live from `/status` (0.5 s, reset on each power-on); the rest
 `/stats` (10 s). Time is walking time (moving only); avg mph is `miles / time`. Day/week/month
 buckets follow the **US Eastern** wall calendar (`EST5EDT`, DST-aware) so "today" rolls over
 at local midnight; weeks start Sunday. The stored log stays in UTC epoch (`/log.csv` is UTC).
+
+**Gamification** (subtle motivation; all in the `game` object of `/stats`):
+- **Daily goal + progress bar** — distance target (`goal_mi`, default 2.0, set via `/goal`); the
+  top bar fills toward `today.miles / goal_mi`. Advances each log record (~≤4 min), not every 0.5 s.
+- **Streak** — 🔥 consecutive days you hit the goal, plus longest run. Both are recomputed from the
+  ~370-day window each call (goal-relative → not persisted), so changing the goal re-derives them.
+- **Personal bests** — best single day for **distance** and for **time**, over last 7d / 30d /
+  all-time. All-time is **NVS-persisted** (value + date) since the log rolls off. 🏆 flags a new
+  best today. Note: distance and steps rank identically (steps = miles·1609.34/`STRIDE_M`), so there
+  is no separate "best steps" record — the distance record *is* the steps record.
+- **Momentum + milestones** — this-week-vs-last-week ▲/▼ %, a 7-day activity dot strip (●/○), and a
+  lifetime-distance marker every `MILESTONE_MI` (25 mi) off a monotonic `life_mi` counter that
+  **`/reset` does not clear** (odometer resets independently). `life_mi` is seeded once from the
+  odometer on first boot, so it's an estimate for miles walked before the feature existed.
 
 **Update firmware over WiFi** (no disassembly):
 ```bash
@@ -203,12 +218,18 @@ The log is `LOG_SEGS` (6) files × `LOG_SEG_BYTES` (100 KB) ≈ 600 KB. When the
 fills, it advances and **erases the next one — dropping the oldest data**. So it's bounded
 forever and never fails silently: ~75k records ≈ several years (at ~50 changes/day, ~4 yrs).
 
-- `GET /stats` → `{today, week, month, total_hours, total_miles, total_steps, records, days:[…]}`
+- `GET /stats` → `{today, week, month, total_hours, total_miles, total_steps, records, game, days:[…]}`
   where `today`/`week`/`month` are each `{hours, miles, steps}`. Buckets follow the **US Eastern**
   calendar (`LOCAL_TZ = EST5EDT`, DST-aware): `today` = local calendar day, `week` = Sun-start
   week, `month` = calendar month. `days:[{d,hours,miles}]` is per-day (Eastern date) for the last
   60 days. Power-off gaps are filtered by a 10-min cap so they aren't counted as walking. Steps are
   derived from miles via `STRIDE_M` (steps ≈ miles·1609.34/STRIDE_M).
+- `game` object: `{goal_mi, streak, streak_best, today_record, best:{d7,d30,all}, week_mi,
+  lastweek_mi, life_mi, milestone_step, milestone_next, dots[7]}` — each `best.*` is `{mi, s}` and
+  `best.all` adds `mi_date`/`s_date`. Records/streaks reconstruct from a **370-day** internal window
+  (`STAT_DAYS`; the JSON `days[]` still emits only 60). All-time distance/time records persist in NVS
+  (`recdmi`/`recds`+dates); streak counters are recomputed live (goal-relative). Gamification tunables
+  live by `STRIDE_M`: `GOAL_MI_DEFAULT`, `STAT_DAYS`, `MILESTONE_MI`, `ACTIVE_MI`.
 - `GET /log.csv` → the raw log as `epoch,utc,mph`, oldest→newest (UTC, unaffected by `LOCAL_TZ`).
   Reconstruct however you like: between consecutive records speed is constant, so
   `hours += Δt`, `miles += mph·Δt`.
