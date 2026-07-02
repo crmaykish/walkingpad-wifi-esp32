@@ -86,6 +86,7 @@ static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 static float    g_speed_mph = 0.0f;
 static double   g_dist_mi   = 0.0;    /* persisted odometer (survives reboots, resettable) */
 static double   g_sess_mi   = 0.0;    /* live session distance since power-on (starts at 0) */
+static double   g_sess_s    = 0.0;    /* live session MOVING seconds since power-on (speed>0) */
 static uint16_t g_rawV = 0;
 static uint8_t  g_cmd  = 0;
 static uint32_t g_frames = 0;
@@ -263,6 +264,7 @@ static void uart_task(void *arg) {
         double inc = (double)g_speed_mph * ((double)dt / 1e6) / 3600.0;
         g_dist_mi += inc;
         g_sess_mi += inc;
+        if (g_speed_mph > 0.0f) g_sess_s += (double)dt / 1e6;   /* moving time only */
         float cur = g_speed_mph;
         double snapshot = g_dist_mi;
         taskEXIT_CRITICAL(&mux);
@@ -289,9 +291,9 @@ static void uart_task(void *arg) {
 
 /* ------------------- HTTP ------------------- */
 static esp_err_t status_get(httpd_req_t *req) {
-    float sp; double mi, smi; uint16_t V; uint8_t cmd; uint32_t fr; int64_t lf;
+    float sp; double mi, smi, ss; uint16_t V; uint8_t cmd; uint32_t fr; int64_t lf;
     taskENTER_CRITICAL(&mux);
-    sp = g_speed_mph; mi = g_dist_mi; smi = g_sess_mi; V = g_rawV; cmd = g_cmd; fr = g_frames; lf = g_last_frame_us;
+    sp = g_speed_mph; mi = g_dist_mi; smi = g_sess_mi; ss = g_sess_s; V = g_rawV; cmd = g_cmd; fr = g_frames; lf = g_last_frame_us;
     taskEXIT_CRITICAL(&mux);
     double m = mi * 1609.34, sm = smi * 1609.34;
     int link = (lf && (esp_timer_get_time() - lf) < STALE_US) ? 1 : 0;
@@ -300,11 +302,11 @@ static esp_err_t status_get(httpd_req_t *req) {
     char buf[640];
     int len = snprintf(buf, sizeof(buf),
         "{\"speed_mph\":%.1f,\"speed_kmh\":%.2f,\"distance_mi\":%.3f,\"distance_m\":%.1f,"
-        "\"steps_est\":%.0f,\"session_mi\":%.3f,\"session_steps\":%.0f,"
+        "\"steps_est\":%.0f,\"session_mi\":%.3f,\"session_steps\":%.0f,\"session_s\":%.0f,"
         "\"uptime_s\":%lld,\"raw_V\":%u,\"cmd\":\"0x%02X\",\"frames\":%lu,"
         "\"link\":\"%s\",\"rssi\":%d,\"ip\":\"%s\",\"ap_mode\":%s,\"heap\":%lu,"
         "\"log_records\":%lu,\"log_seg\":%d,\"time_synced\":%s,\"epoch\":%lld}",
-        sp, sp * 1.60934, mi, m, m / STRIDE_M, smi, sm / STRIDE_M,
+        sp, sp * 1.60934, mi, m, m / STRIDE_M, smi, sm / STRIDE_M, ss,
         (long long)((esp_timer_get_time() - g_boot_us) / 1000000),
         V, cmd, (unsigned long)fr, link ? "ok" : "stale", rssi, g_ip,
         g_ap_active ? "true" : "false", (unsigned long)esp_get_free_heap_size(),
@@ -523,49 +525,57 @@ static const char PAGE[] =
 "body{font-family:system-ui,sans-serif;background:#111;color:#eee;text-align:center;margin:0;padding:2rem}"
 ".big{font-size:4rem;font-weight:700;margin:.15em}.u{opacity:.6;font-size:.95rem}"
 "h3.sec{margin:1.5rem 0 .3rem;opacity:.55;font-weight:600;letter-spacing:.08em;text-transform:uppercase;font-size:.8rem}"
-".row{display:flex;justify-content:center;gap:1rem;margin-top:.4rem;flex-wrap:wrap}"
-".card{background:#1c1c1c;padding:.8rem 1.3rem;border-radius:12px;min-width:5rem}"
+".row{display:flex;justify-content:center;gap:.7rem;margin-top:.4rem;flex-wrap:wrap}"
+".card{background:#1c1c1c;padding:.75rem 1rem;border-radius:12px;min-width:4.3rem}"
 ".card .big{font-size:2rem;margin:.1em}"
 "button{margin:.4rem;padding:.5rem 1rem;border:0;border-radius:8px;background:#2d6;color:#000;font-weight:600}"
 "a{color:#6cf}.stale{color:#e55}small{opacity:.5}</style>"
 "<h2>&#128694; Walking Pad</h2>"
 "<div class=big id=spd>--</div><div class=u>mph now (<span id=kmh>--</span> km/h)</div>"
-"<div class=row style=margin-top:.7rem>"
-"<div class=card><div class=big id=s_mi>--</div><div class=u>miles this session</div></div>"
-"<div class=card><div class=big id=s_st>--</div><div class=u>steps this session</div></div></div>"
+"<h3 class=sec>This Session</h3><div class=row>"
+"<div class=card><div class=big id=s_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=s_tm>--</div><div class=u>time</div></div>"
+"<div class=card><div class=big id=s_av>--</div><div class=u>avg mph</div></div>"
+"<div class=card><div class=big id=s_st>--</div><div class=u>steps</div></div></div>"
 "<h3 class=sec>Today</h3><div class=row>"
 "<div class=card><div class=big id=d_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=d_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=d_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=d_st>--</div><div class=u>steps</div></div></div>"
 "<h3 class=sec>This Week</h3><div class=row>"
 "<div class=card><div class=big id=w_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=w_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=w_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=w_st>--</div><div class=u>steps</div></div></div>"
 "<h3 class=sec>This Month</h3><div class=row>"
 "<div class=card><div class=big id=m_mi>--</div><div class=u>miles</div></div>"
+"<div class=card><div class=big id=m_tm>--</div><div class=u>time</div></div>"
 "<div class=card><div class=big id=m_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=m_st>--</div><div class=u>steps</div></div></div>"
 "<h3 class=sec>Lifetime</h3><div class=row>"
 "<div class=card><div class=big id=t_mi>--</div><div class=u>miles</div></div>"
-"<div class=card><div class=big id=t_hr>--</div><div class=u>hours</div></div>"
+"<div class=card><div class=big id=t_tm>--</div><div class=u>time</div></div>"
+"<div class=card><div class=big id=t_av>--</div><div class=u>avg mph</div></div>"
 "<div class=card><div class=big id=t_st>--</div><div class=u>steps</div></div></div>"
 "<div class=u id=meta style=margin-top:1rem></div>"
 "<div style=margin-top:1rem><a href=/log.csv>download log CSV</a> &nbsp; <a href=/stats>stats JSON</a></div>"
 "<div style=margin-top:1rem><button onclick=\"fetch('/reset')\">reset odometer</button></div>"
 "<div style=margin-top:1.5rem><small>firmware update (.bin):</small><br>"
 "<input type=file id=fw><button onclick=up()>flash</button> &nbsp;<a href=/setup>wifi setup</a></div>"
-"<script>function fill(p,o){document.getElementById(p+'_mi').textContent=o.miles.toFixed(2);"
-"document.getElementById(p+'_av').textContent=(o.hours>0?o.miles/o.hours:0).toFixed(1);"
-"document.getElementById(p+'_st').textContent=o.steps.toFixed(0);}"
+"<script>function gid(i){return document.getElementById(i);}"
+"function dur(h){var m=Math.round(h*60);return m<60?m+'m':Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m';}"
+"function fill(p,o){gid(p+'_mi').textContent=o.miles.toFixed(2);"
+"gid(p+'_tm').textContent=dur(o.hours);"
+"gid(p+'_av').textContent=(o.hours>0?o.miles/o.hours:0).toFixed(1);"
+"gid(p+'_st').textContent=o.steps.toFixed(0);}"
 "async function u(){try{let d=await(await fetch('/status')).json();"
 "spd.textContent=d.speed_mph.toFixed(1);kmh.textContent=d.speed_kmh.toFixed(2);"
-"s_mi.textContent=d.session_mi.toFixed(2);s_st.textContent=d.session_steps.toFixed(0);"
+"fill('s',{miles:d.session_mi,hours:d.session_s/3600,steps:d.session_steps});"
 "meta.textContent='V='+d.raw_V+' cmd='+d.cmd+' link='+d.link+' rssi='+d.rssi+' ip='+d.ip+' odo='+d.distance_mi.toFixed(2)+'mi log='+d.log_records+' up '+d.uptime_s+'s';"
 "meta.className=d.link=='ok'?'u':'u stale';}catch(e){meta.textContent='no connection';}}"
 "async function s(){try{let d=await(await fetch('/stats')).json();"
 "fill('d',d.today);fill('w',d.week);fill('m',d.month);"
-"t_hr.textContent=d.total_hours.toFixed(1);t_mi.textContent=d.total_miles.toFixed(2);"
-"t_st.textContent=d.total_steps.toFixed(0);}catch(e){}}"
+"fill('t',{miles:d.total_miles,hours:d.total_hours,steps:d.total_steps});}catch(e){}}"
 "async function up(){let f=fw.files[0];if(!f){alert('pick a .bin');return;}"
 "if(!confirm('flash '+f.name+' ('+f.size+' bytes)?'))return;"
 "let r=await fetch('/update',{method:'POST',body:f});alert(await r.text());}"
