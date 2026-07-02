@@ -7,8 +7,11 @@
  *   cmd 0x42 = run-at-speed, value V = HH*256 + LL, mph = (V - 105) / 160
  *   cmd 0x40 / 0xA2 / 0x50 = idle/stopped -> 0 mph
  *
- * Wiring: pin5 --(4.7k series + 10k to GND, ~3.4V)--> RX2/GPIO16 (UART2 RX); pin1 -> GND;
- *         pad 5V rail -> ESP32 5V/VIN. RX only. PASSIVE divider — no active level shifter.
+ * Wiring (recommended): pin5 --(4.7k series + 10k to GND, ~3.4V)--> RX2/GPIO16 (UART2 RX);
+ *         pin1 -> GND; pad 5V rail -> ESP32 5V/VIN. RX only. PASSIVE divider, no active shifter.
+ * AS BUILT: pin5 (5V) wired DIRECTLY to RX2/GPIO16 (no divider) — relies on the ESP32's
+ *         unofficial 5V tolerance; OUT OF SPEC (GPIO abs-max ~3.6V; UART idles high so 5V is
+ *         continuous on the ESD clamp). Works so far; suspect FIRST if RX ever gets flaky.
  *
  * Logging: 8-byte records {epoch, 0.1mph, flags, checksum} appended to a SEGMENTED
  * CIRCULAR LOG on LittleFS (LOG_SEGS files of LOG_SEG_BYTES each). When the active

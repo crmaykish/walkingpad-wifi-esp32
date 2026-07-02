@@ -112,6 +112,15 @@ pin 5 ──[ 4.7k ]──┬──► RX2 / GPIO16   (UART2 RX on the ESP32)
 ```
 → ~3.4 V logic high. Also: **pad 5 V rail → ESP32 `VIN`/`5V`** (its regulator makes 3.3 V).
 
+> ⚠️ **AS-BUILT DEVIATION (the divider was skipped).** In the actual sealed unit, pin 5 (5 V)
+> is wired **directly** to `RX2`/GPIO16 — no divider, no shifter — betting on the ESP32's
+> *unofficial* 5 V tolerance. It works today (frames decode, checksums pass, `link: ok`), but
+> it is **out of spec**: GPIO16's absolute max is ~3.6 V, and because UART idles **high**, 5 V
+> sits on the pin *continuously*, forcing current through the input's ESD clamp diode — which
+> can degrade the pin over time. **If RX ever goes flaky** — `frames` stops climbing, `link`
+> flaps, or `raw_V` reads garbage — suspect this first and retrofit the 4.7 k + 10 k divider
+> above (requires opening the case). Fine for now; just the prime suspect if reliability drifts.
+
 > ⚠️ **Do NOT use an active/bidirectional level shifter (e.g. TXS0108E) here.** It back-drives
 > pin 5 during ESP boot and corrupts the console↔drive handshake → the pad throws **E07**.
 > A bare FTDI or the passive divider is fine because they're high-impedance / receive-only.
