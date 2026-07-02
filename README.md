@@ -228,7 +228,7 @@ For decoding/verifying the pad **without** the ESP32 — just a **5 V FTDI** on 
   mph + accumulated distance + step estimate. Compare against the console display.
   ```bash
   python3 tools/speedo.py            # auto-detect FTDI
-  python3 tools/speedo.py /dev/ttyUSB0 0.67   # explicit port + stride(m)
+  python3 tools/speedo.py /dev/ttyUSB0 0.624  # explicit port + stride(m)
   ```
 - **`tools/framemon.py`** — raw frame monitor; prints a frame each time it *changes*, with
   carets under the bytes that moved. How the speed byte was originally found.
@@ -246,7 +246,9 @@ Both need `pyserial` (`pip install --user pyserial`).
   (ESP32 = CP210x `10c4`, the FTDI = `0403`).
 - **`link: stale` in /status** just means no frames right now (pad off / not wired) — the
   WiFi/web side is still up.
-- **Steps** will never be exact — no footfall data on the wire. Tune `STRIDE_M` if you care.
+- **Steps** will never be exact — no footfall data on the wire; it's `distance / STRIDE_M`.
+  `STRIDE_M` is calibrated to **0.624 m** against the pad's own step counter (est 4424 vs the
+  console's 4752 on a 2026-07-02 walk). Re-tune it if the estimate drifts from the console.
 - Before sealing, sanity-check **RSSI** from the install spot via `/status`; keep the ESP
   antenna away from the steel frame.
 

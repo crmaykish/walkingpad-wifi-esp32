@@ -57,7 +57,9 @@
 #define WIFI_PASS   "YOUR_PASSWORD"
 #endif
 #define HOSTNAME    "walkingpad"       /* -> http://walkingpad.local/ */
-#define STRIDE_M    0.67               /* metres/step (rough; tune to taste) */
+#define STRIDE_M    0.624              /* metres/step; calibrated to the pad's own footfall
+                                          counter (est 4424 vs real 4752 on 2026-07-02:
+                                          0.67 * 4424/4752). Re-tune if the estimate drifts. */
 #define NTP_SERVER  "pool.ntp.org"
 #define LOCAL_TZ    "EST5EDT,M3.2.0/2,M11.1.0/2"  /* US Eastern, DST-aware: day/week/month
                                                      buckets use this so they match the wall
