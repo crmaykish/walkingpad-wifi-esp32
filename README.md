@@ -192,6 +192,9 @@ forever and never fails silently: ~75k records ≈ several years (at ~50 changes
 - `GET /log/reset` → wipe the log.
 - Records logged before the first NTP sync (e.g. an idle boot) have `epoch=0` and are skipped by
   `/stats`. Logging is UTC — apply your timezone when reconstructing.
+- `/stats` counts only up to the **last logged record**, so mid-walk it can trail the live
+  `distance_mi` odometer (`/status`) by up to one heartbeat (~4 min). The odometer is the
+  continuous live figure; `/stats` is the durable reconstructed history.
 - Tunables at the top of `main/walkingpad_bridge.c`: `LOG_SEGS`, `LOG_SEG_BYTES`, `LOG_HB_US`,
   `LOG_GAP_CAP_S`.
 
