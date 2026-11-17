@@ -28,6 +28,11 @@ a JSON API, and a persistent walking history with a few motivational extras.
   factory recovery image, and opens a WiFi setup access point if it can't join the network. After
   it was sealed, every later change went in over the air.
 
+<p align="center">
+  <img src="media/dashboard.png" width="300" alt="Walking pad dashboard showing current speed, session/today/week/month/lifetime stats, streak, goal progress, and personal bests"><br>
+  <em>The live dashboard, served by the ESP32. By November 2026 it had logged 110+ miles and about 50 hours of walking.</em>
+</p>
+
 ## The reverse-engineering story
 
 The goal was to get speed and distance off a pad that offered no data interface at all. Two
@@ -71,6 +76,11 @@ On the scope, pin 5 showed an 831 µs period. That is a two-bit cycle, so a bit 
 which means **2400 baud**. Capturing at 2400 8N1 produced 36 out of 36 identical, cleanly framed
 packets.
 
+<p align="center">
+  <img src="media/serial_data_capture.jpg" width="600" alt="Oscilloscope showing a burst of UART data on the console-to-drive line"><br>
+  <em>A frame on the console↔drive data line (Siglent SDS1104X-E, 2 ms/div). The bit timing gave the baud rate.</em>
+</p>
+
 **5. Decoding the frames.** `tools/framemon.py` prints a frame only when it changes and puts carets
 under the bytes that moved. I stepped the speed up 0.1 mph at a time and called out each value
 while it watched. Two bytes moved in lockstep with the display, and seven data points fit a straight
@@ -88,6 +98,11 @@ mph = (V − 105) / 160         e.g. V=185 → 0.5 mph, V=281 → 1.1 mph
 ```
 
 `tools/speedo.py` then checked the formula live against the console display.
+
+<p align="center">
+  <img src="media/serial_probe_wiring.jpg" width="420" alt="The walking pad's console board opened up and powered, with jumper wires running to a USB FTDI serial adapter"><br>
+  <em>Bench capture: the console board opened up and powered, with a 5 V FTDI adapter (red LED, bottom left) tapped onto its serial lines.</em>
+</p>
 
 **6. What's missing from the wire.** Distance isn't sent; the console just integrates speed over
 time, so the bridge does the same. **Steps aren't sent either.** The console counts real footfalls
@@ -219,6 +234,7 @@ sdkconfig.defaults         board-specific config (40 MHz XTAL, 4 MB flash, rollb
 tools/framemon.py          bench: raw frame monitor that highlights changed bytes
 tools/speedo.py            bench: live decoder/speedometer over an FTDI
 docs/REFERENCE.md          API, log format, build/flash/OTA, recovery
+media/                     dashboard screenshot and bench photos
 CLAUDE.md                  project guide Claude Code reads at the start of each session
 ```
 
