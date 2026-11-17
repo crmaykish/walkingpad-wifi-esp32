@@ -56,6 +56,9 @@
 #ifndef WIFI_PASS
 #define WIFI_PASS   "YOUR_PASSWORD"
 #endif
+#ifndef SETUP_AP_PASS
+#define SETUP_AP_PASS "walkingpad"     /* fallback-AP password (WPA2: 8..63 chars); override in wifi_secrets.h */
+#endif
 #define HOSTNAME    "walkingpad"       /* -> http://walkingpad.local/ */
 #define STRIDE_M    0.624              /* metres/step; calibrated to the pad's own footfall
                                           counter (est 4424 vs real 4752 on 2026-07-02:
@@ -804,7 +807,7 @@ static void start_setup_ap(void) {
     wifi_config_t ap = {0};
     strcpy((char *)ap.ap.ssid, "walkingpad-setup");
     ap.ap.ssid_len = strlen("walkingpad-setup");
-    strcpy((char *)ap.ap.password, "walkingpad");
+    strlcpy((char *)ap.ap.password, SETUP_AP_PASS, sizeof(ap.ap.password));
     ap.ap.max_connection = 2;
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
     ap.ap.channel = 1;
