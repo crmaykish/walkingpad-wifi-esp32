@@ -1,287 +1,244 @@
 # Walking Pad Telemetry Bridge
 
-Reverse-engineered the internal serial link of a cheap Amazon walking pad and built an
-**ESP32 that taps it and serves live telemetry over WiFi** (speed + distance as a web
-dashboard and JSON API). The pad itself only ever exposed a Bluetooth *speaker* — there
-was no telemetry interface. This project adds one.
+I have a cheap, unbranded under-desk walking pad whose only wireless feature was a Bluetooth
+speaker. I reverse-engineered its internal serial link and added a WiFi telemetry board: an
+ESP32 sealed inside the pad listens to the console's speed commands and serves a live dashboard,
+a JSON API, and a persistent walking history with a few motivational extras.
 
-> **Future me, in 3 months:** everything you need is below. The 30-second version is in
-> **[Quick reference](#quick-reference)**. The firmware is in `main/`, bench tools in `tools/`.
+> **About this project.** This is a portfolio piece showing how I use
+> [Claude Code](https://claude.com/claude-code) for hardware and embedded work. It isn't a product,
+> and nobody else is expected to build it, since it's tied to one specific pad. **Claude Code wrote
+> nearly all of the code and docs in this repo** and handled the software side of the
+> investigation. Every commit carries a `Co-Authored-By: Claude` trailer. My part was the physical
+> work, the direction, and the ground truth. I opened and probed the pad, wired the tap, ran the
+> pad during captures, chose what to build, and tested it on real walks. The split is laid out in
+> [How it was built](#how-it-was-built-with-claude-code).
 
----
+## What it does
 
-## Quick reference
+- Decodes the pad's internal **2400-baud console→drive UART** to get live speed, with no
+  modification to the pad's own electronics (the tap only listens).
+- Calculates distance and estimated steps, keeps an odometer that survives reboots, and logs every
+  speed change to flash in a bounded circular log that holds years of history.
+- Serves a phone-friendly **dashboard** at `http://walkingpad.local/` showing current speed and
+  miles · time · avg mph · steps for this session, today, this week, this month, and lifetime.
+- Adds some light **gamification**: a daily goal with a progress bar, a streak counter, personal
+  bests (7-day / 30-day / all-time), week-over-week momentum, and lifetime distance milestones.
+- Was **built to be sealed**. It updates over WiFi with automatic rollback, keeps a USB-only
+  factory recovery image, and opens a WiFi setup access point if it can't join the network. After
+  it was sealed, every later change went in over the air.
 
-**Read telemetry** (any device on the LAN):
-- Dashboard: **http://walkingpad.local/** (or the DHCP IP; was `192.168.1.223`)
-- JSON: `GET /status` → `speed_mph`, `speed_kmh`, `distance_mi`, `distance_m`, `steps_est`,
-  `session_mi`, `session_steps`, `session_s` (live, since last power-on — reset to 0 on every
-  boot; `session_s` is *moving* seconds, so `session_mi / (session_s/3600)` is the session avg mph),
-  `uptime_s`, `raw_V`, `cmd`, `frames`, `link` (`ok`/`stale`), `rssi`, `ip`, `ap_mode`, `heap`
-- Reset odometer: `GET /reset`
-- **History:** `GET /stats` (JSON — today / this week / this month / lifetime hours·miles·steps, plus per-day, plus the `game` object below) · `GET /log.csv` (download the full event log) · `GET /log/reset` (wipe it)
-- **Daily goal:** `GET /goal` reads it; `GET /goal?mi=2.5` sets it (0.1–50 mi, persisted).
+## The reverse-engineering story
 
-The dashboard shows **current speed** up top, then a consistent **4-column grid** — *miles ·
-time · avg mph · steps* — for **This Session / Today / This Week / This Month / Lifetime**.
-The Session row is live from `/status` (0.5 s, reset on each power-on); the rest come from
-`/stats` (10 s). Time is walking time (moving only); avg mph is `miles / time`. Day/week/month
-buckets follow the **US Eastern** wall calendar (`EST5EDT`, DST-aware) so "today" rolls over
-at local midnight; weeks start Sunday. The stored log stays in UTC epoch (`/log.csv` is UTC).
+The goal was to get speed and distance off a pad that offered no data interface at all. Two
+promising paths turned out to be dead ends before the real one appeared.
 
-**Gamification** (subtle motivation; all in the `game` object of `/stats`):
-- **Daily goal + progress bar** — distance target (`goal_mi`, default 2.0, set via `/goal`); the
-  top bar fills toward `today.miles / goal_mi`. Advances each log record (~≤4 min), not every 0.5 s.
-- **Streak** — 🔥 consecutive days you hit the goal, plus longest run. Both are recomputed from the
-  ~370-day window each call (goal-relative → not persisted), so changing the goal re-derives them.
-- **Personal bests** — best single day for **distance** and for **time**, over last 7d / 30d /
-  all-time. All-time is **NVS-persisted** (value + date) since the log rolls off. 🏆 flags a new
-  best today. Note: distance and steps rank identically (steps = miles·1609.34/`STRIDE_M`), so there
-  is no separate "best steps" record — the distance record *is* the steps record.
-- **Momentum + milestones** — this-week-vs-last-week ▲/▼ %, a 7-day activity dot strip (●/○), and a
-  lifetime-distance marker every `MILESTONE_MI` (25 mi) off a monotonic `life_mi` counter that
-  **`/reset` does not clear** (odometer resets independently). `life_mi` is seeded once from the
-  odometer on first boot, so it's an estimate for miles walked before the feature existed.
+**1. Bluetooth: dead end.** The pad announces "bluetooth mode", so the first hope was a
+BLE fitness service. Claude Code ran BlueZ on my Linux PC. A power-cycle test (I switched the pad
+off and on while it watched scans) showed which device was the pad. Pairing and an SDP browse
+returned the complete service list: A2DP audio sink, AVRCP, and PnP info. There was no serial
+profile, no BLE, and no vendor service. The modalias company ID (`0x05D6`) identified a **Jieli**
+Bluetooth-audio SoC, so the Bluetooth is only a speaker.
 
-**Update firmware over WiFi** (no disassembly):
-```bash
-~/Workspace/claude/mcu-tools/mcu_build.sh esp32 ~/Workspace/treadmill/walkingpad-bridge
-curl --data-binary @~/Workspace/treadmill/walkingpad-bridge/build/walkingpad_bridge.bin \
-     http://walkingpad.local/update
-```
-…or pick the `.bin` in the dashboard. A bad image auto-rolls-back.
-
-**WiFi won't connect** (moved, changed router): the ESP opens an AP **`walkingpad-setup`**
-(password `walkingpad`) → join it → browse **http://192.168.4.1/setup** → enter new
-SSID/password → it saves to NVS and reboots.
-
-**Bricked** (should never happen — OTA has rollback): the USB-only `factory` image is
-still intact. Open it up, `mcu_flash.sh` (see [Flashing](#flashing-usb--first-time--recovery)).
-
-- ESP32 MAC (for a DHCP reservation): `b0:cb:d8:ce:14:20`
-- Firmware source: `main/walkingpad_bridge.c` · Bench tools: `tools/`
-
----
-
-## The hardware findings
-
-Board silkscreen: **`KRDJK1608E-2.2.4GDY`** (the pad's digital/console PCB).
+**2. Teardown.** I opened the console. The board is `KRDJK1608E-2.2.4GDY`:
 
 | Chip | What it is | Role |
 |---|---|---|
-| **SC95F7616BP** | SinOne 8051 MCU (1T core, runs at **5 V**) | The brain: drives the LCD, commands motor speed, counts steps. **Telemetry originates here.** |
-| **AC223…RYD** (24 MHz + trace antenna) | **Jieli** Bluetooth-audio SoC (BT company ID `0x05D6`; Modalias `bluetooth:v05D6p000Ad0240`) | The "bluetooth mode" **speaker**. Audio only. |
-| sanded SOIC-16 + 12 MHz + SOIC-8 flash | (marking removed) | Likely the voice-prompt subsystem. Not relevant. |
-| unpopulated 14-pin footprint w/ trace antenna | Tuya/ESP8285 WiFi-module socket | The "smart SKU" WiFi option — **firmware-gated on this unit, dead** (see below). |
+| SC95F7616BP | SinOne 1T 8051 MCU, 5 V | Drives the LCD, commands motor speed, counts steps. All telemetry starts here. |
+| AC223…RYD + trace antenna | Jieli BT-audio SoC | The "bluetooth mode" speaker. Audio only. |
+| Sanded SOIC-16 + SOIC-8 flash | Marking removed | Most likely voice prompts. |
+| **Unpopulated 14-pin footprint + trace antenna** | Tuya/ESP8285 WiFi-module socket | The "smart" SKU's WiFi option, with a 5 V UART routed to the MCU. |
 
-**Bluetooth is a dead end for telemetry.** The pad's only BT interface is a Classic-BT
-A2DP audio sink (device name literally `"Bluetooth"`, addr `82:1B:A6:1F:BD:2E`, class
-`0x240404`). SDP shows only Audio Sink + AVRCP + Device-ID. No SPP, no BLE, no data.
+**3. The empty WiFi socket: also a dead end.** With the console powered on the bench (9 V on the
+main connector, away from mains), it shows error **E07**, which is expected without the drive
+board. Claude Code wrote a script that sent Tuya heartbeat and query frames through a 5 V FTDI
+adapter, sweeping baud rates. Nothing answered. To rule out E07 or reversed pins as the cause, I
+reassembled the pad and ran the belt, and we tried both pin orientations at every baud rate. It
+stayed silent. This SKU's firmware simply never starts the WiFi task.
 
-**The Tuya WiFi port is also dead.** The empty module footprint has a 5 V UART wired to
-the SC95F, but this no-WiFi SKU's firmware never starts the Tuya task — the line is
-totally silent in every state (idle, running, E07-cleared, both TX/RX orientations).
-Not worth revisiting.
-
-**The telemetry lives on the console↔drive-board link** — a 5-pin connector:
+**4. The console↔drive link.** The real data is on the 5-pin connector between the console and the
+motor-drive board:
 
 | Pin | Signal |
 |---|---|
 | 1 | GND |
 | 2 | +12 V |
-| 3 | ~3.6 V static (reference/enable) |
-| 4 | data **drive→console** (keepalive/status, `AA 42 00 00 42 55`) |
-| **5** | data **console→drive** ← **the speed command we tap** |
+| 3 | ~3.6 V static |
+| 4 | data, drive→console (a keepalive) |
+| **5** | **data, console→drive: the speed command** |
 
----
+On the scope, pin 5 showed an 831 µs period. That is a two-bit cycle, so a bit lasts about 415 µs,
+which means **2400 baud**. Capturing at 2400 8N1 produced 36 out of 36 identical, cleanly framed
+packets.
 
-## The protocol (decoded)
-
-**UART: 2400 baud, 8N1, 5 V logic.** Frame is 6 bytes:
+**5. Decoding the frames.** `tools/framemon.py` prints a frame only when it changes and puts carets
+under the bytes that moved. I stepped the speed up 0.1 mph at a time and called out each value
+while it watched. Two bytes moved in lockstep with the display, and seven data points fit a straight
+line exactly:
 
 ```
 AA  <cmd>  <HH>  <LL>  <CK>  55
-│    │      └──┬──┘     │     └─ trailer 0x55
-│    │        │        └─────── checksum = (cmd + HH + LL) & 0xFF
-│    │        └──────────────── 16-bit value, big-endian: V = HH*256 + LL
-│    └───────────────────────── command
-└────────────────────────────── header 0xAA
+│    │      └──┬──┘     │     └─ trailer
+│    │         │        └─────── checksum = (cmd + HH + LL) & 0xFF
+│    │         └──────────────── V = HH·256 + LL
+│    └────────────────────────── 0x42 = run at speed; 0x40 / 0xA2 / 0x50 = idle
+└─────────────────────────────── header
+
+mph = (V − 105) / 160         e.g. V=185 → 0.5 mph, V=281 → 1.1 mph
 ```
 
-- **`cmd 0x42` = run-at-speed.** `V` is the speed setpoint (what the display shows):
+`tools/speedo.py` then checked the formula live against the console display.
 
-  **`mph = (V − 105) / 160`**  (equivalently `V = 160·mph + 105`; +16 counts per 0.1 mph)
+**6. What's missing from the wire.** Distance isn't sent; the console just integrates speed over
+time, so the bridge does the same. **Steps aren't sent either.** The console counts real footfalls
+from a dedicated sensor and only displays them. The bridge therefore estimates steps from distance
+and a stride length. The stride was later calibrated against the console's own count. The first
+estimate was 4424 steps against the console's 4752; after calibration it came out at 4750.
 
-  Verified: `V=185`→0.5, `201`→0.6, `217`→0.7 … `281`→1.1 mph.
-- **`cmd 0x40`, `0xA2`** = assembled idle/stopped. **`cmd 0x50`** = standalone idle (no drive
-  board). All non-`0x42` commands ⇒ **0 mph**.
-- **Distance** is not transmitted — the console just integrates speed over time, so we do the
-  same: `distance = ∫ speed·dt`.
-- **Steps** are not on the wire at all. The console counts real footfalls from a dedicated
-  sensor and only displays them. `steps_est` here is `distance / STRIDE_M` — an estimate.
+## The tap
 
----
-
-## The tap (wiring)
-
-Pin 5 is 5 V; the ESP32 is **not** 5 V-tolerant. Use a **passive resistor divider** —
-listen-only, so it never disturbs the bus:
+Pin 5 carries 5 V logic, and the ESP32 is a 3.3 V part. The intended design is a passive divider
+that only listens:
 
 ```
-pin 5 ──[ 4.7k ]──┬──► RX2 / GPIO16   (UART2 RX on the ESP32)
-                  │
-                [ 10k ]
-                  │
-                 GND (common with pad pin 1 and ESP GND)
+pad pin 5 ──[ 4.7k ]──┬──► ESP32 GPIO16 (UART2 RX)
+                      │
+                    [ 10k ]
+                      │
+pad pin 1 (GND) ──────┴──── ESP32 GND          pad 5 V rail ──► ESP32 VIN
 ```
-→ ~3.4 V logic high. Also: **pad 5 V rail → ESP32 `VIN`/`5V`** (its regulator makes 3.3 V).
 
-> ⚠️ **AS-BUILT DEVIATION (the divider was skipped).** In the actual sealed unit, pin 5 (5 V)
-> is wired **directly** to `RX2`/GPIO16 — no divider, no shifter — betting on the ESP32's
-> *unofficial* 5 V tolerance. It works today (frames decode, checksums pass, `link: ok`), but
-> it is **out of spec**: GPIO16's absolute max is ~3.6 V, and because UART idles **high**, 5 V
-> sits on the pin *continuously*, forcing current through the input's ESD clamp diode — which
-> can degrade the pin over time. **If RX ever goes flaky** — `frames` stops climbing, `link`
-> flaps, or `raw_V` reads garbage — suspect this first and retrofit the 4.7 k + 10 k divider
-> above (requires opening the case). Fine for now; just the prime suspect if reliability drifts.
+Three hardware lessons came out of this:
 
-> ⚠️ **Do NOT use an active/bidirectional level shifter (e.g. TXS0108E) here.** It back-drives
-> pin 5 during ESP boot and corrupts the console↔drive handshake → the pad throws **E07**.
-> A bare FTDI or the passive divider is fine because they're high-impedance / receive-only.
+- **An active level shifter broke the pad.** A TXS0108E bidirectional shifter back-drove pin 5
+  while the ESP32 booted, corrupting the console↔drive handshake and causing E07. A passive,
+  receive-only tap avoids that, and the firmware never assigns a TX pin to this UART.
+- **Safety check before grounding anything to the PC:** we confirmed the pad's logic ground is
+  isolated from mains before connecting a USB-grounded FTDI to it.
+- **As built, the divider was skipped.** In the sealed unit, pin 5 goes straight into GPIO16, which
+  relies on the ESP32's unofficial 5 V tolerance. That is out of spec: UART idles high, so 5 V sits
+  on the pin's ESD clamp continuously. It works, and it's documented as the first thing to suspect
+  if reception ever becomes flaky.
 
-The pad's low-voltage ground is **isolated from mains** (verified — no continuity from
-logic GND to the AC pins), so tying a grounded FTDI/PC to it during bench work is safe.
+## Firmware design
 
----
+The firmware is ESP-IDF 5.4 C on a classic ESP32 (WROOM), all in one file:
+[`main/walkingpad_bridge.c`](main/walkingpad_bridge.c).
 
-## The ESP32 firmware
+```
+pad pin 5 ─► UART2 RX ─► uart_task ── frame sync (AA…55 + checksum) ─► speed
+                             ├─ ∫ speed·dt ─► odometer / session / lifetime counters (NVS)
+                             └─ settled speed change or 4-min heartbeat ─► circular log (LittleFS)
 
-- **Board:** ESP32-D0WD-V3 (WROOM), classic dual-core Xtensa, CP2102 USB-UART.
-- **SDK:** ESP-IDF v5.4 (`~/Workspace/claude/esp-idf`), via the `mcu-*` skills/scripts in
-  `~/Workspace/claude/mcu-tools/`.
-- **Source:** `main/walkingpad_bridge.c`.
+HTTP server:  /  dashboard     /status  live JSON        /stats  history rebuilt from the log
+              /log.csv         /goal    daily goal       /update OTA (raw .bin)    /setup WiFi
+```
 
-**Features**
-- UART2 RX = **GPIO16** (the board's `RX2` pin) @ 2400 8N1; byte-syncs on `AA…55` + checksum.
-- WiFi station; serves an auto-refresh dashboard (`/`) + JSON (`/status`) + `/reset`.
-- **OTA** (`POST /update`, raw `.bin`) with dual app slots + rollback.
-- **mDNS** → `walkingpad.local`.
-- **WiFi setup-AP fallback** (`walkingpad-setup` / `walkingpad`) → `/setup` form → NVS creds.
-- **Odometer persisted to NVS** (survives reboots).
-- **Persistent event log** on a LittleFS partition — see [Persistent logging](#persistent-logging).
+- **Unattended operation.** The flash holds a USB-only golden `factory` image plus two OTA slots
+  that alternate, and an image that never comes up healthy rolls back automatically. If the device
+  can't join WiFi within 30 s, it opens a setup access point where new credentials can be entered.
+  mDNS makes it reachable as `walkingpad.local`.
+- **Bounded storage.** Each speed change becomes an 8-byte timestamped record in a six-segment
+  circular log on a ~960 KB LittleFS partition. When a segment fills, the oldest one is erased.
+  Storage can't fill up, and the log holds about four years at normal use.
+- **History is rebuilt from the log, not accumulated.** `/stats` replays the log on each request.
+  It buckets by the **local** calendar (US Eastern, DST-aware) and filters out power-off gaps.
+  Timestamps stay in UTC epoch.
+- **Gamification state is split by what it depends on.** Streaks depend on the goal, so they're
+  always recomputed from a 370-day window and changing the goal re-derives them. All-time records
+  are saved to flash, because the circular log eventually drops the days they came from.
+- **Minimal stack.** There's no framework. The dashboard is a single HTML/JS string compiled into
+  the firmware, and the JSON is built by hand.
 
-**Partition layout** (4 MB flash, custom `partitions.csv`): `factory` (golden, USB-only
-recovery) + `ota_0` + `ota_1` (OTA ping-pongs between them) + **`storage`** (~960 KB LittleFS
-for the event log). `FLASHSIZE_4MB` + `APP_ROLLBACK_ENABLE` in `sdkconfig.defaults`. Changing
-this table (e.g. resizing `storage`) needs a **USB** flash — it can't be done over OTA.
+The full API, JSON fields, log format, and operations runbook are in
+[`docs/REFERENCE.md`](docs/REFERENCE.md).
 
-**WiFi credentials** live in gitignored **`main/wifi_secrets.h`** — two `#define`s
-(`WIFI_SSID` / `WIFI_PASS`) — so they're never committed. If that file is missing (e.g. a
-fresh clone), the build falls back to placeholder defines that won't connect; recreate it,
-or just set creds at runtime via the setup AP (stored in NVS, which overrides the compiled
-default). Example `main/wifi_secrets.h`:
+## How it was built with Claude Code
+
+Development took about a day of real time (July 1–2, 2026), split between bench work and remote
+iteration once the unit was sealed.
+
+| Me | Claude Code |
+|---|---|
+| Picked the problem and did all the physical work: opening the pad, bench-powering the console, connecting the FTDI, probing with a scope | Drove the Bluetooth investigation through BlueZ and wrote the capture and probing scripts |
+| Ran the pad and called out display values during captures | Interpreted the scope timing and decoded the frame format, checksum, and speed formula |
+| Soldered the tap, installed the ESP32, and sealed the pad | Wrote the ESP32 firmware, the web dashboard, and the bench tools |
+| Made the product decisions, such as which stats to show, which gamification features to add, and using distance as the goal metric | Built, flashed, and OTA-deployed each change, then checked it against the live JSON API |
+| Supplied ground truth, like the console's real step count for calibration, and tested on real walks | Wrote the docs, the commit messages, and [`CLAUDE.md`](CLAUDE.md) |
+
+Some things made this work better than "paste code, try it, report back":
+
+- **Hardware in the loop.** A small set of local Claude Code skills (`mcu-detect`, `mcu-build`,
+  `mcu-flash`) wrap ESP-IDF and esptool. With them, Claude Code could find boards by USB vendor ID,
+  build, flash at a baud rate this board tolerates, and read the serial console. It iterated on the
+  real board instead of handing me code to try.
+- **An observable device.** After the unit was sealed, OTA plus the JSON API let Claude Code check
+  the device without me. Each change was built, pushed over WiFi, and confirmed by reading
+  `/status` and `/stats`. For example, it checked that the odometer survived a reboot and that the
+  streaks matched the log.
+- **Persistent context.** Memory notes and `CLAUDE.md` carried pinouts, decisions, and gotchas from
+  one session to the next.
+
+**Timeline** (from the commit history):
+
+| When | Milestone |
+|---|---|
+| Jul 1, afternoon | Bluetooth and WiFi-socket dead ends, teardown, protocol decoded at the bench |
+| Jul 1, evening | First firmware: decode, dashboard, OTA, mDNS, setup AP, odometer (`2b4cc26`) |
+| | Persistent circular log with SNTP timestamps (`b37ba86`); the last USB flash |
+| | Sealed into the pad and checked on a real walk (`17704d1`) |
+| Jul 2 | Day/week/month on local time (`ea1cc3f`): everything over OTA from here |
+| | Live session stats (`12cdc47`), stride calibration (`475d83d`), uniform stats grid (`f4b7856`) |
+| | Gamification (`ca32e8c`) |
+
+**Problems we hit along the way:**
+
+- The TXS0108E level shifter caused E07 (see [The tap](#the-tap)).
+- This ESP32 board has a **marginal crystal**. Some boots derived the clock from 26 MHz, which
+  shifted every baud rate. The fix was to pin the crystal setting to 40 MHz and flash at 115200.
+- The first gamification build saved the longest streak to flash. Lowering the goal then inflated
+  it, so streaks are now always recomputed from the log window.
+- The emoji escapes (`\u…`) inside the dashboard's JavaScript have to be double-backslashed inside
+  the C string literal. Otherwise the C compiler reads them as its own universal character names.
+
+## Known limitations
+
+- **No authentication.** This is a LAN-only toy, so OTA, the resets, and goal changes are open to
+  anything on the network, or on the setup AP while it's active.
+- The tap is **out of spec** as built (see above).
+- **Steps are estimates**, calculated as distance divided by a calibrated stride.
+- It's specific to this pad's protocol, this ESP32 board, and US Eastern time.
+
+## Repository layout
+
+```
+main/walkingpad_bridge.c   firmware: UART decode, logging, stats, HTTP, WiFi/OTA
+main/idf_component.yml     managed components (mdns, littlefs)
+partitions.csv             factory + ota_0 + ota_1 + LittleFS "storage"
+sdkconfig.defaults         board-specific config (40 MHz XTAL, 4 MB flash, rollback)
+tools/framemon.py          bench: raw frame monitor that highlights changed bytes
+tools/speedo.py            bench: live decoder/speedometer over an FTDI
+docs/REFERENCE.md          API, log format, build/flash/OTA, recovery
+CLAUDE.md                  project guide Claude Code reads at the start of each session
+```
+
+## Building
+
+Standard ESP-IDF 5.4 project. WiFi credentials (and optionally the setup-AP password) go in a
+gitignored `main/wifi_secrets.h`:
+
 ```c
 #pragma once
-#define WIFI_SSID "YourNetwork"
-#define WIFI_PASS "YourPassword"
+#define WIFI_SSID      "YourNetwork"
+#define WIFI_PASS      "YourPassword"
+#define SETUP_AP_PASS  "something-else"   // optional; 8–63 chars
 ```
 
-**Config knobs** (top of `main/walkingpad_bridge.c`): `WIFI_SSID/PASS`, `HOSTNAME`,
-`STRIDE_M` (step estimate), `PAD_RX_GPIO`, `PAD_BAUD`.
-
-### Building
 ```bash
-~/Workspace/claude/mcu-tools/mcu_build.sh esp32 ~/Workspace/treadmill/walkingpad-bridge
+idf.py set-target esp32 && idf.py build
+idf.py -p /dev/ttyUSB0 -b 115200 flash                                    # first flash, over USB
+curl --data-binary @build/walkingpad_bridge.bin http://walkingpad.local/update   # after that, OTA
 ```
 
-### Flashing (USB — first time / recovery)
-The ESP shows up as a CP2102 (`mcu-detect` finds the port; it drifts, was `/dev/ttyUSB1`).
-This board has a **marginal 26 MHz crystal**, so flash at **115200** (the tooling default).
-`esptool erase_flash` may fail on a skewed boot — that's fine, a full flash still works:
-```bash
-ESP32_PORT=/dev/ttyUSB1 ESP32_FLASH_BAUD=115200 \
-  ~/Workspace/claude/mcu-tools/mcu_flash.sh esp32 ~/Workspace/treadmill/walkingpad-bridge
-```
-
-### Updating (WiFi — normal case)
-See [Quick reference](#quick-reference). Runs from `ota_0`/`ota_1`; `factory` is untouched.
-
----
-
-## Persistent logging
-
-Every settled **speed change** is written as an 8-byte record `{epoch, 0.1 mph, flags, checksum}`
-to a **segmented circular log** on the `storage` LittleFS partition, plus a heartbeat every
-~4 min while moving (so a power cut loses at most a few minutes). Time comes from **SNTP** (UTC).
-
-The log is `LOG_SEGS` (6) files × `LOG_SEG_BYTES` (100 KB) ≈ 600 KB. When the active segment
-fills, it advances and **erases the next one — dropping the oldest data**. So it's bounded
-forever and never fails silently: ~75k records ≈ several years (at ~50 changes/day, ~4 yrs).
-
-- `GET /stats` → `{today, week, month, total_hours, total_miles, total_steps, records, game, days:[…]}`
-  where `today`/`week`/`month` are each `{hours, miles, steps}`. Buckets follow the **US Eastern**
-  calendar (`LOCAL_TZ = EST5EDT`, DST-aware): `today` = local calendar day, `week` = Sun-start
-  week, `month` = calendar month. `days:[{d,hours,miles}]` is per-day (Eastern date) for the last
-  60 days. Power-off gaps are filtered by a 10-min cap so they aren't counted as walking. Steps are
-  derived from miles via `STRIDE_M` (steps ≈ miles·1609.34/STRIDE_M).
-- `game` object: `{goal_mi, streak, streak_best, today_record, best:{d7,d30,all}, week_mi,
-  lastweek_mi, life_mi, milestone_step, milestone_next, dots[7]}` — each `best.*` is `{mi, s}` and
-  `best.all` adds `mi_date`/`s_date`. Records/streaks reconstruct from a **370-day** internal window
-  (`STAT_DAYS`; the JSON `days[]` still emits only 60). All-time distance/time records persist in NVS
-  (`recdmi`/`recds`+dates); streak counters are recomputed live (goal-relative). Gamification tunables
-  live by `STRIDE_M`: `GOAL_MI_DEFAULT`, `STAT_DAYS`, `MILESTONE_MI`, `ACTIVE_MI`.
-- `GET /log.csv` → the raw log as `epoch,utc,mph`, oldest→newest (UTC, unaffected by `LOCAL_TZ`).
-  Reconstruct however you like: between consecutive records speed is constant, so
-  `hours += Δt`, `miles += mph·Δt`.
-- `GET /log/reset` → wipe the log.
-- Records logged before the first NTP sync (e.g. an idle boot) have `epoch=0` and are skipped by
-  `/stats`. Only the day/week/month **bucketing** is localized; stored timestamps stay UTC epoch.
-- `/stats` counts only up to the **last logged record**, so mid-walk it can trail the live
-  `distance_mi` odometer (`/status`) by up to one heartbeat (~4 min). The odometer is the
-  continuous live figure; `/stats` is the durable reconstructed history.
-- Tunables at the top of `main/walkingpad_bridge.c`: `LOG_SEGS`, `LOG_SEG_BYTES`, `LOG_HB_US`,
-  `LOG_GAP_CAP_S`.
-
-## Bench debugging tools (`tools/`)
-
-For decoding/verifying the pad **without** the ESP32 — just a **5 V FTDI** on pin 5
-(FTDI RX ← pin 5 via the same divider or direct, FTDI GND ← pin 1, no TX):
-
-- **`tools/speedo.py`** — live speedometer. Auto-detects the FTDI, decodes pin 5, prints
-  mph + accumulated distance + step estimate. Compare against the console display.
-  ```bash
-  python3 tools/speedo.py            # auto-detect FTDI
-  python3 tools/speedo.py /dev/ttyUSB0 0.624  # explicit port + stride(m)
-  ```
-- **`tools/framemon.py`** — raw frame monitor; prints a frame each time it *changes*, with
-  carets under the bytes that moved. How the speed byte was originally found.
-  ```bash
-  python3 tools/framemon.py /dev/ttyUSB1 2400 30   # port baud seconds
-  ```
-Both need `pyserial` (`pip install --user pyserial`).
-
----
-
-## Gotchas / notes
-
-- **Marginal crystal:** `CONFIG_ESP32_XTAL_FREQ_40` is pinned; flash/console at 115200.
-- **Serial port drift:** USB ports re-enumerate — use `mcu-detect` / match by USB VID
-  (ESP32 = CP210x `10c4`, the FTDI = `0403`).
-- **`link: stale` in /status** just means no frames right now (pad off / not wired) — the
-  WiFi/web side is still up.
-- **Steps** will never be exact — no footfall data on the wire; it's `distance / STRIDE_M`.
-  `STRIDE_M` is calibrated to **0.624 m** against the pad's own step counter (est 4424 vs the
-  console's 4752 on a 2026-07-02 walk). Re-tune it if the estimate drifts from the console.
-- Before sealing, sanity-check **RSSI** from the install spot via `/status`; keep the ESP
-  antenna away from the steel frame.
-
----
-
-## How it was found (short version)
-
-BT scan → the pad's only radio is a Jieli A2DP speaker (no telemetry) → the unpopulated
-Tuya WiFi port is firmware-gated/silent → opened the console, found the 5-pin console↔drive
-connector → scoped pin 5, `2400 8N1` (a scope "period" read was a 2-bit cycle, so half of
-831 µs = 2400 baud) → captured frames while stepping speed → `cmd 0x42`, `mph=(V−105)/160`,
-checksum `(cmd+HH+LL)&0xFF` → tapped pin 5 into an ESP32 (passive divider; a TXS0108E tripped
-E07) → firmware serves it over WiFi with OTA so it never needs opening again.
+[`docs/REFERENCE.md`](docs/REFERENCE.md) has the rest: recovery, the partition layout, and the
+bench tools.
